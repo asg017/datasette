@@ -1173,13 +1173,6 @@ async def test_nocount(ds_client, nocount, expected_count):
     assert response.json()["count"] == expected_count
 
 
-def test_nocount_nofacet_if_shape_is_object(app_client_with_trace):
-    response = app_client_with_trace.get(
-        "/fixtures/facetable.json?_trace=1&_shape=object"
-    )
-    assert "count(*)" not in response.text
-
-
 @pytest.mark.asyncio
 async def test_expand_labels(ds_client):
     response = await ds_client.get(

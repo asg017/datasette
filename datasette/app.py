@@ -50,7 +50,6 @@ from .plugins import DEFAULT_PLUGINS, get_plugins, pm
 from .renderer import json_renderer
 from .resources import DatabaseResource, TableResource
 from .tokens import TokenInvalid
-from .tracer import AsgiTracer
 from .url_builder import Urls
 from .utils import (
     SPATIALITE_FUNCTIONS,
@@ -286,11 +285,6 @@ SETTINGS = (
         "template_debug",
         False,
         "Allow display of template debug information with ?_context=1",
-    ),
-    Setting(
-        "trace_debug",
-        False,
-        "Allow display of SQL trace debug information with ?_trace=1",
     ),
     Setting("base_url", "/", "Datasette URLs should use this base path"),
 )
@@ -2817,8 +2811,6 @@ class Datasette:
             self.close()
 
         asgi = CrossOriginProtectionMiddleware(DatasetteRouter(self, routes), self)
-        if self.setting("trace_debug"):
-            asgi = AsgiTracer(asgi)
         asgi = AsgiLifespan(asgi, on_shutdown=[_close_on_shutdown])
         asgi = AsgiRunOnFirstRequest(asgi, on_startup=[setup_db, self.invoke_startup])
         for wrapper in pm.hook.asgi_wrapper(datasette=self):
