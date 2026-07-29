@@ -1,7 +1,6 @@
 import urllib.parse
 
 import pytest
-from bs4 import BeautifulSoup as Soup
 
 from datasette.app import Datasette
 
@@ -227,3 +226,27 @@ async def test_table_csv_stream(ds_client):
         "/fixtures/compound_three_primary_keys.csv?_stream=1"
     )
     assert len([b for b in response.content.split(b"\r\n") if b]) == 1002
+
+
+def _db_query_texts(otel_spans):
+    return [
+        span.attributes.get("db.query.text", "")
+        for span in otel_spans.get_finished_spans()
+        if span.name == "db.query"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_table_csv_stream_does_not_calculate_facets(ds_client, otel_spans):
+    response = await ds_client.get("/fixtures/simple_primary_key.csv")
+    assert response.status_code == 200
+    queries = _db_query_texts(otel_spans)
+    assert not any("select content, count(*) as n" in q for q in queries)
+
+
+@pytest.mark.asyncio
+async def test_table_csv_stream_does_not_calculate_counts(ds_client, otel_spans):
+    response = await ds_client.get("/fixtures/simple_primary_key.csv")
+    assert response.status_code == 200
+    queries = _db_query_texts(otel_spans)
+    assert not any("select count(*)" in q for q in queries)
