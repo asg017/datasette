@@ -852,14 +852,9 @@ def test_truncate_url(url, length, expected):
         ),
         (
             [
-                ("settings.trace_debug", "true"),
                 ("plugins.datasette-ripgrep.path", "/etc"),
-                ("settings.trace_debug", "false"),
             ],
             {
-                "settings": {
-                    "trace_debug": False,
-                },
                 "plugins": {
                     "datasette-ripgrep": {
                         "path": "/etc",

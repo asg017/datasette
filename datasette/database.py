@@ -13,7 +13,6 @@ from pathlib import Path
 import sqlite_utils
 
 from .inspect import inspect_hash
-from .tracer import trace
 from .utils import (
     call_with_supported_arguments,
     detect_fts,
@@ -257,10 +256,9 @@ class Database:
                 cursor, return_all=return_all, returning_limit=returning_limit
             )
 
-        with trace("sql", database=self.name, sql=sql.strip(), params=params):
-            results = await self.execute_write_fn(
-                _inner, block=block, request=request, transaction=transaction
-            )
+        results = await self.execute_write_fn(
+            _inner, block=block, request=request, transaction=transaction
+        )
         return results
 
     async def execute_write_script(self, sql, block=True, request=None):
@@ -269,10 +267,9 @@ class Database:
         def _inner(conn):
             return conn.executescript(sql)
 
-        with trace("sql", database=self.name, sql=sql.strip(), executescript=True):
-            results = await self.execute_write_fn(
-                _inner, block=block, transaction=False, request=request
-            )
+        results = await self.execute_write_fn(
+            _inner, block=block, transaction=False, request=request
+        )
         return results
 
     async def execute_write_many(self, sql, params_seq, block=True, request=None):
@@ -289,13 +286,9 @@ class Database:
 
             return conn.executemany(sql, count_params(params_seq)), count
 
-        with trace(
-            "sql", database=self.name, sql=sql.strip(), executemany=True
-        ) as kwargs:
-            results, count = await self.execute_write_fn(
-                _inner, block=block, request=request
-            )
-            kwargs["count"] = count
+        results, count = await self.execute_write_fn(
+            _inner, block=block, request=request
+        )
         return results
 
     async def execute_isolated_fn(self, fn):
@@ -565,8 +558,7 @@ class Database:
             else:
                 return Results(rows, False, cursor.description)
 
-        with trace("sql", database=self.name, sql=sql.strip(), params=params):
-            results = await self.execute_fn(sql_operation_in_thread)
+        results = await self.execute_fn(sql_operation_in_thread)
         return results
 
     @property
