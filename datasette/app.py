@@ -50,7 +50,6 @@ from .plugins import DEFAULT_PLUGINS, get_plugins, pm
 from .renderer import json_renderer
 from .resources import DatabaseResource, TableResource
 from .tokens import TokenInvalid
-from .tracer import AsgiTracer
 from .url_builder import Urls
 from .utils import (
     SPATIALITE_FUNCTIONS,
