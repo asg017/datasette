@@ -403,15 +403,24 @@ async def test_invoke_startup_produces_one_trace_not_dozens_of_orphans(otel_span
 
 
 @pytest.mark.asyncio
-async def test_block_false_write_spans_can_end_after_parent_closes(
+async def test_block_false_write_spans_are_linked_root_spans_not_children(
     ds_client, otel_spans
 ):
-    # Known, documented (not fixed) limitation: a block=False write returns
-    # immediately, so the enclosing db.query span can finish and export
-    # before db.write.queue_wait/db.write.execute exist at all. This test
-    # pins that behaviour down rather than "fixing" it - the parent/child
-    # relationship is still correct once the child spans do appear, the
-    # waterfall view is just incomplete for block=False.
+    """
+    A block=False write returns immediately without awaiting the reply
+    future, so the enclosing span can finish (and export) before
+    db.write.queue_wait/db.write.execute even exist. Parenting those spans to
+    it used to be a documented-but-not-fixed wart: a child bar outliving its
+    already-closed parent is legal OTel but renders badly in a trace UI.
+
+    The fix: for block=False the enqueueing request *caused* the write
+    without *containing* it, so its spans are built as their own roots (no
+    parent) carrying a single Link back to the enqueueing span's context
+    instead. This test awaits the reply future as its synchronisation point,
+    since block=False means the spans may not have been exported yet, and
+    pins both halves of the distinction: block=False gets a root plus a link,
+    block=True still parents exactly as before.
+    """
     db = ds_client.ds.get_database("fixtures")
 
     def slow_write(conn):
@@ -419,8 +428,9 @@ async def test_block_false_write_spans_can_end_after_parent_closes(
 
         _time.sleep(0.05)
 
+    # --- block=False: root span, single link back to the enqueuer -----
     with tracer.start_as_current_span("test-block-false-parent") as parent_span:
-        parent_span_id = parent_span.get_span_context().span_id
+        parent_ctx = parent_span.get_span_context()
         # Calling the private _send_to_write_thread() directly (rather than
         # execute_write_fn(..., block=False), which only returns task_id)
         # so the test can await the reply_future itself.
@@ -431,17 +441,36 @@ async def test_block_false_write_spans_can_end_after_parent_closes(
     await reply_future
 
     spans = otel_spans.get_finished_spans()
-    execute_spans = [
-        s
-        for s in spans
-        if s.name == "db.write.execute"
-        and s.parent
-        and s.parent.span_id == parent_span_id
-    ]
-    assert execute_spans, "expected a db.write.execute span parented to the closed span"
+    execute_spans = [s for s in spans if s.name == "db.write.execute"]
+    assert execute_spans, "expected a db.write.execute span"
     execute_span = execute_spans[-1]
-    # The child ended strictly after its already-closed parent.
+
+    # No longer a child of the (already-closed) enqueueing span...
+    assert execute_span.parent is None, "block=False write span must be a root"
+    # ...even though it genuinely does end after that span closed, which is
+    # exactly why parenting it was the wrong relationship.
     assert execute_span.end_time > parent_span.end_time
+    # ...and carries exactly one link back to the enqueueing span instead.
+    assert len(execute_span.links) == 1
+    link = execute_span.links[0]
+    assert link.context.trace_id == parent_ctx.trace_id
+    assert link.context.span_id == parent_ctx.span_id
+
+    # --- block=True: unchanged - still a real, awaited child -----------
+    otel_spans.clear()
+    with tracer.start_as_current_span("test-block-true-parent") as parent_span2:
+        parent_span_id = parent_span2.get_span_context().span_id
+        await db._send_to_write_thread(slow_write, block=True)
+
+    spans = otel_spans.get_finished_spans()
+    execute_spans = [s for s in spans if s.name == "db.write.execute"]
+    assert execute_spans, "expected a db.write.execute span"
+    execute_span = execute_spans[-1]
+    assert execute_span.parent is not None
+    assert execute_span.parent.span_id == parent_span_id
+    assert (
+        not execute_span.links
+    ), "block=True write span has a real parent, so it should carry no link"
 
 
 @pytest.mark.asyncio
