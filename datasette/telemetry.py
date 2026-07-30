@@ -50,9 +50,32 @@ from .telemetry_registry import (
     OPERATION,
     PLUGIN,
 )
+from .version import __version__
 
-tracer = otel_trace.get_tracer("datasette")
-meter = otel_metrics.get_meter("datasette")
+# A schema URL is a machine-readable claim about which semantic-convention
+# version the names on this scope's spans and metrics match. A consumer
+# doing schema translation uses it to replay the renames between that
+# version and whatever version it wants, so the claim has to hold exactly -
+# a wrong one makes translation wrong rather than merely uninformative.
+#
+# Every OTel-governed name emitted below is the current spelling as of
+# semconv 1.29.0: db.system, db.namespace, db.query.text,
+# db.query.parameter.<key>, db.client.operation.duration, error.type,
+# code.function. Two of those were renamed in semconv 1.30.0 - db.system to
+# db.system.name, and code.function to code.function.name - and this module
+# still emits the pre-1.30.0 spelling of both. Declaring the latest schema
+# would therefore be a false claim about names we do not emit, and would
+# stop a consumer from translating db.system and code.function forward to
+# what they are now called; declaring 1.29.0 keeps the claim true for every
+# name actually on the wire. Everything under datasette.* is Datasette's own
+# and outside semconv, so it is unaffected by this URL either way.
+#
+# Bump this deliberately, together with the attribute renames it implies -
+# it is a claim about the names, not decoration.
+SCHEMA_URL = "https://opentelemetry.io/schemas/1.29.0"
+
+tracer = otel_trace.get_tracer("datasette", __version__, schema_url=SCHEMA_URL)
+meter = otel_metrics.get_meter("datasette", __version__, schema_url=SCHEMA_URL)
 
 MAX_SQL_LENGTH = 2048
 
