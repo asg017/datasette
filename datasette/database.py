@@ -622,7 +622,16 @@ class Database:
             # boundary in execute_fn() (or run_in_executor() for immutable
             # databases) - so it parents correctly to the enclosing
             # db.query span despite running on a different thread.
-            with tracer.start_as_current_span("db.query.execute"):
+            #
+            # Callers passing log_sql_errors=False are probing and treat a
+            # failure as an expected answer - see the matching handling on the
+            # db.query span in execute(). Without this, facet suggestion marks
+            # two spans per text column as failed on every table page.
+            with tracer.start_as_current_span(
+                "db.query.execute",
+                record_exception=log_sql_errors,
+                set_status_on_exception=log_sql_errors,
+            ):
                 with sqlite_timelimit(conn, time_limit_ms):
                     try:
                         cursor = conn.cursor()

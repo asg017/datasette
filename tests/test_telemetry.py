@@ -298,3 +298,32 @@ async def test_block_false_write_spans_can_end_after_parent_closes(
     execute_span = execute_spans[-1]
     # The child ended strictly after its already-closed parent.
     assert execute_span.end_time > parent_span.end_time
+
+
+@pytest.mark.asyncio
+async def test_suppressed_sql_error_is_not_an_error_on_the_execute_span(
+    ds_client, otel_spans
+):
+    """
+    The inner db.query.execute span must honour log_sql_errors too.
+
+    It is created inside the worker thread, so it would otherwise mark every
+    facet-suggestion probe as failed even though the outer db.query span
+    correctly reports the failure as suppressed.
+    """
+    db = ds_client.ds.get_database("fixtures")
+    with pytest.raises(sqlite3.OperationalError):
+        await db.execute(
+            "select json_type(content) from simple_primary_key where content != ''",
+            log_sql_errors=False,
+        )
+
+    execute_spans = [
+        span
+        for span in otel_spans.get_finished_spans()
+        if span.name == "db.query.execute"
+    ]
+    assert execute_spans
+    span = execute_spans[-1]
+    assert span.status.status_code == StatusCode.UNSET
+    assert not [event for event in span.events if event.name == "exception"]
