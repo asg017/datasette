@@ -5,8 +5,14 @@ creates a `TracerProvider`, never configures an exporter, and never sets a sampl
 installed every span is a no-op and costs approximately nothing.
 
 That means "turning tracing on" is entirely the job of whoever runs Datasette. This directory shows
-three ways to do it, **none of which needs Docker, a collector, or any external service** — the
-third is a real OTLP export over the wire, received by a small Python script.
+several ways to do it, **none of which needs Docker** — including a real OTLP export over the wire,
+and Jaeger driven from its own binary.
+
+| | |
+|---|---|
+| `trace_demo.py` | Self-contained span waterfall. No network, no agent |
+| `otlp_receiver.py` | A ~120 line OTLP/HTTP receiver, to verify a real export |
+| `plugins/otel_asgi.py` | Gives each request a root span — needed for any trace UI |
 
 ## 1. A span waterfall, in about ten seconds
 
@@ -109,6 +115,7 @@ OTEL_LOGS_EXPORTER=none \
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
 OTEL_SERVICE_NAME=datasette \
+OTEL_BSP_SCHEDULE_DELAY=1000 \
   uv run --with opentelemetry-exporter-otlp-proto-http \
     opentelemetry-instrument datasette mydb.db
 ```
@@ -141,7 +148,94 @@ between "the write was slow" and "the write waited behind another writer".
 The receiver is a debugging aid, not a backend: nothing is persisted, it speaks OTLP/HTTP only (not
 gRPC), and it ignores metrics and logs.
 
-## 4. Sending it to a real backend
+## 4. Jaeger, with the binary rather than Docker
+
+Jaeger ingests OTLP directly, so nothing extra is needed between it and Datasette. Assuming the
+Jaeger binary is on your PATH:
+
+**Terminal 1 — Jaeger.**
+
+```bash
+jaeger                                          # Jaeger v2
+COLLECTOR_OTLP_ENABLED=true jaeger-all-in-one   # Jaeger v1
+```
+
+Both listen on **16686** (UI), **4317** (OTLP/gRPC) and **4318** (OTLP/HTTP). Do not run
+`otlp_receiver.py` at the same time — it binds 4318 as well, and Jaeger replaces it here.
+
+**Terminal 2 — Datasette**, with the `otel_asgi` plugin from `plugins/` so requests get a root span:
+
+```bash
+OTEL_TRACES_EXPORTER=otlp \
+OTEL_METRICS_EXPORTER=none \
+OTEL_LOGS_EXPORTER=none \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+OTEL_SERVICE_NAME=datasette \
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment=demo \
+OTEL_BSP_SCHEDULE_DELAY=1000 \
+  uv run --with opentelemetry-exporter-otlp-proto-http \
+         --with opentelemetry-instrumentation-asgi \
+    opentelemetry-instrument datasette mydb.db \
+      --plugins-dir demos/otel/plugins -p 8001
+```
+
+Two of those are worth calling out:
+
+- **`OTEL_SERVICE_NAME=datasette`** is what you pick from Jaeger's Service dropdown. Leave it out
+  and the SDK defaults to `unknown_service:<executable>`, which is where a mysterious
+  "unknown service" entry in the dropdown comes from.
+- **`OTEL_BSP_SCHEDULE_DELAY=1000`** drops the batch flush from its ~10 second default to ~1 second.
+  Measured: all 225 spans of a request arrive within a second instead of after ten. For a demo this
+  is the difference between "it works" and "it looks broken". Do not use it in production — it
+  trades export efficiency for latency.
+
+**Terminal 3 — make a request**, then wait about a second:
+
+```bash
+curl -s -o /dev/null http://localhost:8001/mydb/sometable
+```
+
+**Verify:** open <http://localhost:16686>, choose service `datasette`, click Find Traces. You want
+the trace named `GET /mydb/sometable` — roughly 190 spans:
+
+- `db.query` with `db.query.execute` nested inside it — that nesting crosses a thread boundary
+- `datasette.hook.*`, one per plugin hook implementation
+- `datasette.permission_check`, each fanning out to `permission_resources_sql`
+- on a write endpoint, `db.write.queue_wait` and `db.write.execute` as siblings
+
+### Reading the result
+
+**Ignore the ~24 tiny traces.** One request produces 25 distinct trace IDs: one real trace with ~190
+spans, and roughly 24 single-span or two-span traces from startup — `prepare_connection`,
+`register_events`, `register_actions`, `asgi_wrapper`, and the `db.query` spans that build the
+internal catalog. Those run before any request exists, so there is no root span for them to attach
+to. Measured breakdown from a real run:
+
+```
+distinct trace_ids : 25
+  1 trace  : 189 spans, root = GET /demo_cli/items
+  10 traces: root = db.query           (startup catalog queries)
+  2 traces : root = db.write.execute   (startup catalog writes)
+  ~12      : root = datasette.hook.*   (startup hooks)
+```
+
+To skip them in the Jaeger UI, set **Min Duration** to `10ms` in the search form, or pick the
+specific `GET /...` operation from the Operation dropdown. Both leave you with just the request.
+
+**`db.query` spans show as `internal`, not as database calls.** Datasette emits them with
+`SpanKind.INTERNAL`, so Jaeger will not render them with its database styling even though they carry
+`db.system` / `db.namespace` / `db.query.text`. OpenTelemetry's semantic conventions say database
+client spans should be `SpanKind.CLIENT`; that is a genuine gap in the instrumentation rather than
+something to configure here.
+
+### Why the plugin is needed
+
+Without `plugins/otel_asgi.py` everything still gets traced, but every span is a root span. Measured
+on one request: **75 root spans without it, 1 with it** (plus the startup spans above). A trace UI is
+close to unusable in the first case.
+
+## 5. Sending it to a real backend
 
 Any OTLP-compatible backend works through the same agent — Datasette needs no configuration of its
 own. Point the endpoint at your collector instead of the demo receiver:
@@ -150,13 +244,38 @@ own. Point the endpoint at your collector instead of the demo receiver:
 pip install opentelemetry-distro opentelemetry-exporter-otlp opentelemetry-instrumentation-asgi
 
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
-  opentelemetry-instrument datasette mydb.db
+OTEL_SERVICE_NAME=datasette-fec \
+OTEL_METRICS_EXPORTER=none \
+OTEL_LOGS_EXPORTER=none \
+  uv run \
+  --with opentelemetry-distro \
+  --with opentelemetry-exporter-otlp \
+  --with opentelemetry-instrumentation-asgi \
+  --with datasette-libfec \
+  opentelemetry-instrument datasette fec.db --plugins-dir demos/otel/plugins
 ```
 
-Adding `opentelemetry-instrumentation-asgi` is worthwhile: it creates the per-request root span that
+**Always set `OTEL_SERVICE_NAME`.** Without it the SDK falls back to
+`unknown_service:<executable>`, and your traces land under a service by that name rather than under
+`datasette`.
+
+**Always set `OTEL_METRICS_EXPORTER=none` and `OTEL_LOGS_EXPORTER=none`** unless your backend really
+does accept all three signals. `opentelemetry-distro` defaults every signal to OTLP, so the agent
+will try to ship metrics and logs alongside traces. Jaeger only implements the traces service, so
+you get a stream of:
+
+```
+Failed to export metrics to localhost:4317, error code: StatusCode.UNIMPLEMENTED,
+error details: unknown service opentelemetry.proto.collector.metrics.v1.MetricsService
+```
+
+Tracing still works throughout — it is the metrics pipeline failing, not yours — but the noise
+buries anything useful.
+
+The `otel_asgi` plugin is worth loading here too: it creates the per-request root span that
 Datasette's spans nest underneath. Without it the nesting among Datasette's own spans is still
-correct, but there is no enclosing HTTP span — which is why the demo receiver reports 75 root spans
-rather than one per request.
+correct, but there is no enclosing HTTP span, so a trace UI shows dozens of unrelated single-span
+traces per page instead of one request.
 
 This last path is the standard OpenTelemetry agent contract, documented for completeness; it has not
 been verified here against a specific vendor's collector.

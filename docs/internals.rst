@@ -2331,9 +2331,34 @@ Install an ASGI instrumentation package and an exporter, then launch Datasette t
 
     pip install opentelemetry-instrumentation-asgi opentelemetry-exporter-otlp
     OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+    OTEL_SERVICE_NAME=datasette \
+    OTEL_METRICS_EXPORTER=none \
+    OTEL_LOGS_EXPORTER=none \
       opentelemetry-instrument datasette mydb.db
 
 This exports spans over OTLP to a collector listening on ``localhost:4317`` - point ``OTEL_EXPORTER_OTLP_ENDPOINT`` at whichever tracing backend you use.
+
+Always set ``OTEL_SERVICE_NAME``. Without it the OpenTelemetry SDK falls back to ``unknown_service:<executable>``, and your traces will be filed under that name rather than under ``datasette``.
+
+Set ``OTEL_METRICS_EXPORTER=none`` and ``OTEL_LOGS_EXPORTER=none`` unless your backend accepts those signals too. ``opentelemetry-distro`` defaults every signal to OTLP, and a traces-only backend such as Jaeger will reject the others with a repeating ``StatusCode.UNIMPLEMENTED`` / ``unknown service ...MetricsService`` error. Tracing is unaffected, but the log noise is considerable.
+
+Datasette's spans nest correctly among themselves, but nothing in core creates a span for the HTTP request itself, so by default every span is a root span - which a tracing UI displays as dozens of unrelated single-span traces per page. To get one trace per request, wrap Datasette's ASGI app using the :ref:`plugin_asgi_wrapper` hook:
+
+.. code-block:: python
+
+    from opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware
+
+    from datasette import hookimpl
+
+
+    @hookimpl
+    def asgi_wrapper(datasette):
+        def wrap(app):
+            return OpenTelemetryMiddleware(app)
+
+        return wrap
+
+``demos/otel/plugins/otel_asgi.py`` in the Datasette repository contains exactly this plugin, ready to load with ``--plugins-dir``.
 
 Local debugging
 ---------------
