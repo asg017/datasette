@@ -2402,6 +2402,8 @@ Attribute names use the ``datasette.*`` prefix for Datasette-specific data, alon
 
 This reference is generated from ``datasette/telemetry_registry.py``, the single source of truth for every span, attribute and metric Datasette emits. A conformance test makes real requests and compares what is actually emitted against that registry in both directions, so nothing here is hand-maintained and nothing can silently drift out of date.
 
+Spans are ``SpanKind.INTERNAL`` unless a kind is listed below. Only ``db.query`` is ``CLIENT``: it is the one span that represents a call to a database rather than Datasette's own work, and trace UIs use the kind to decide whether to render a span as a database call. Its children stay ``INTERNAL`` because they are Datasette's decomposition of that one query - marking them ``CLIENT`` too would make a single query look like several database calls to anything counting by kind.
+
 .. [[[cog
     from telemetry_doc import spans
     spans(cog)
@@ -2409,6 +2411,8 @@ This reference is generated from ``datasette/telemetry_registry.py``, the single
 
 ``db.query``
     A SQL operation issued by Datasette, covering the full round trip including any time spent queued for a thread.
+
+    Kind: ``CLIENT``.
 
     Attributes:
 

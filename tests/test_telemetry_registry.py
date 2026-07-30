@@ -330,6 +330,12 @@ async def test_every_registered_metric_attribute_is_emitted(emitted_metrics):
 # both at once and pass no matter what. Name and unit drift is prevented by
 # construction here; what the tests below cover is the part that isn't, which
 # is whether the thing is emitted at all.
+#
+# There is no test here that an emitted span's kind matches the registry
+# either, for the same reason: every call site passes `kind=DB_QUERY.kind`, so
+# such a test would compare the registry against itself. What pins the
+# decision is `test_db_query_is_client_kind_and_its_execute_child_is_internal`
+# in test_telemetry.py, which asserts the literal CLIENT and INTERNAL values.
 
 
 def test_registry_has_no_duplicate_names():
