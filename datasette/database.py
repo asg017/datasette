@@ -19,6 +19,9 @@ from opentelemetry.trace import Status, StatusCode
 from .inspect import inspect_hash
 from .telemetry import (
     parameter_attributes,
+    record_operation_duration,
+    record_query_interrupted,
+    record_write_queue_wait,
     should_record_parameters,
     sql_attribute,
     tracer,
@@ -289,9 +292,10 @@ class Database:
             if params:
                 span.set_attribute("datasette.param_count", len(params))
                 self._record_parameters(span, params)
-            results = await self.execute_write_fn(
-                _inner, block=block, request=request, transaction=transaction
-            )
+            with record_operation_duration(self.name, "write"):
+                results = await self.execute_write_fn(
+                    _inner, block=block, request=request, transaction=transaction
+                )
         return results
 
     async def execute_write_script(self, sql, block=True, request=None):
@@ -305,9 +309,10 @@ class Database:
             span.set_attribute("db.namespace", self.name)
             span.set_attribute("db.query.text", sql_attribute(sql))
             span.set_attribute("datasette.executescript", True)
-            results = await self.execute_write_fn(
-                _inner, block=block, transaction=False, request=request
-            )
+            with record_operation_duration(self.name, "write"):
+                results = await self.execute_write_fn(
+                    _inner, block=block, transaction=False, request=request
+                )
         return results
 
     async def execute_write_many(self, sql, params_seq, block=True, request=None):
@@ -329,9 +334,10 @@ class Database:
             span.set_attribute("db.namespace", self.name)
             span.set_attribute("db.query.text", sql_attribute(sql))
             span.set_attribute("datasette.executemany", True)
-            results, count = await self.execute_write_fn(
-                _inner, block=block, request=request
-            )
+            with record_operation_duration(self.name, "write"):
+                results, count = await self.execute_write_fn(
+                    _inner, block=block, request=request
+                )
             span.set_attribute("datasette.rows_returned", count)
         return results
 
@@ -532,9 +538,11 @@ class Database:
                 # this span's duration is the time the task actually spent
                 # waiting in the queue (enqueue -> dequeue), not the near-
                 # zero time spent constructing/ending the span object here.
+                dequeued_at_ns = time.time_ns()
                 tracer.start_span(
                     "db.write.queue_wait", start_time=task.enqueued_at_ns
-                ).end(end_time=time.time_ns())
+                ).end(end_time=dequeued_at_ns)
+                record_write_queue_wait(self.name, dequeued_at_ns - task.enqueued_at_ns)
                 if conn_exception is not None:
                     # fn never runs in this branch, so there is nothing to
                     # wrap in a db.write.execute span.
@@ -700,11 +708,16 @@ class Database:
                 span.set_attribute("datasette.param_count", len(params))
                 self._record_parameters(span, params)
             try:
-                results = await self.execute_fn(sql_operation_in_thread)
+                with record_operation_duration(self.name, "read"):
+                    results = await self.execute_fn(sql_operation_in_thread)
             except QueryInterrupted as e:
                 span.set_status(Status(StatusCode.ERROR, str(e)))
                 span.set_attribute("datasette.interrupted", True)
                 span.record_exception(e)
+                # A counter rather than only a span, because this is the one
+                # thing an operator wants a rate and an alert on, and spans
+                # under a 1% sampler cannot provide either.
+                record_query_interrupted(self.name)
                 raise
             except Exception as e:
                 # log_sql_errors=False means the caller is probing and treats

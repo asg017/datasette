@@ -2315,12 +2315,14 @@ The ``Database`` class also provides properties and methods for introspecting th
 
 .. _internals_telemetry:
 
-OpenTelemetry tracing
-=====================
+OpenTelemetry
+=============
 
-Datasette core depends on `opentelemetry-api <https://pypi.org/project/opentelemetry-api/>`__ only. It never creates a ``TracerProvider``, never configures an exporter and never sets a sampler. With no OpenTelemetry SDK provider installed, every span described on this page is a no-op ``NonRecordingSpan`` - the overhead is close to zero and nothing is recorded or exported anywhere.
+Datasette core depends on `opentelemetry-api <https://pypi.org/project/opentelemetry-api/>`__ only. It never creates a ``TracerProvider`` or a ``MeterProvider``, never configures an exporter and never sets a sampler. With no OpenTelemetry SDK provider installed, every span described on this page is a no-op ``NonRecordingSpan`` and every metric instrument is a no-op - the overhead is close to zero and nothing is recorded or exported anywhere.
 
-Turning tracing on is entirely an operational decision made outside of Datasette itself: run Datasette under the standard ``opentelemetry-instrument`` agent, or embed Datasette inside a host application that installs its own ``TracerProvider``.
+Turning telemetry on is entirely an operational decision made outside of Datasette itself: run Datasette under the standard ``opentelemetry-instrument`` agent, or embed Datasette inside a host application that installs its own providers.
+
+Datasette emits two signals: **traces**, which answer "what happened during this request", and **metrics**, which answer "what is this process doing right now" and survive trace sampling.
 
 Turning tracing on
 ------------------
@@ -2341,6 +2343,20 @@ This exports spans over OTLP to a collector listening on ``localhost:4317`` - po
 Always set ``OTEL_SERVICE_NAME``. Without it the OpenTelemetry SDK falls back to ``unknown_service:<executable>``, and your traces will be filed under that name rather than under ``datasette``.
 
 Set ``OTEL_METRICS_EXPORTER=none`` and ``OTEL_LOGS_EXPORTER=none`` unless your backend accepts those signals too. ``opentelemetry-distro`` defaults every signal to OTLP, and a traces-only backend such as Jaeger will reject the others with a repeating ``StatusCode.UNIMPLEMENTED`` / ``unknown service ...MetricsService`` error. Tracing is unaffected, but the log noise is considerable.
+
+Note that ``OTEL_METRICS_EXPORTER=none`` also discards the metrics described in `Metrics reference`_ below. If you want them, send metrics to a backend that accepts them - typically a Prometheus scrape endpoint or an OTLP collector - rather than turning the exporter off:
+
+.. code-block:: bash
+
+    pip install opentelemetry-exporter-prometheus
+    OTEL_SERVICE_NAME=datasette \
+    OTEL_TRACES_EXPORTER=none \
+    OTEL_METRICS_EXPORTER=prometheus \
+    OTEL_LOGS_EXPORTER=none \
+    OTEL_EXPORTER_PROMETHEUS_PORT=9464 \
+      opentelemetry-instrument datasette mydb.db
+
+Datasette's metrics are then available at ``http://localhost:9464/metrics``.
 
 Datasette's spans nest correctly among themselves, but nothing in core creates a span for the HTTP request itself, so by default every span is a root span - which a tracing UI displays as dozens of unrelated single-span traces per page. To get one trace per request, wrap Datasette's ASGI app using the :ref:`plugin_asgi_wrapper` hook:
 
@@ -2457,8 +2473,63 @@ The spans below were captured by running instrumented requests and recording eve
     - ``datasette.resource`` - omitted when there is no parent filter
     - ``datasette.actor_present``
 
+Metrics reference
+-----------------
+
+Spans describe requests that have finished. They cannot answer *"am I saturating my SQL threads right now?"*, because that is a level rather than an event - and with :ref:`setting_num_sql_threads` defaulting to ``3``, it is usually the first question worth asking about a busy Datasette. Metrics answer it, and unlike spans they are unaffected by trace sampling: an operator sampling 1% of traces still gets 100% of the query latency distribution.
+
+All metric names use the ``datasette.*`` prefix except ``db.client.operation.duration``, which is a standard OpenTelemetry semantic convention metric.
+
+Thread pool and queue gauges
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+These are `observable gauges <https://opentelemetry.io/docs/specs/otel/metrics/api/#asynchronous-gauge>`__: Datasette computes them only when something is collecting, so an instance with no metrics provider installed does no work for them at all.
+
+``datasette.sql.threads.limit``
+    Maximum number of read queries that can run at once - the value of the :ref:`setting_num_sql_threads` setting. Not reported when ``num_sql_threads`` is ``0``, since in that mode queries run on the event loop and there is no pool.
+
+``datasette.sql.threads.queue_depth``
+    Read queries waiting for a free thread in the shared pool. **This is the saturation signal.** Sustained above zero means requests are queueing on ``num_sql_threads`` and the fix is to raise it or to reduce query cost.
+
+``datasette.sql.queries.pending``
+    Read queries submitted to the pool and not yet complete, broken down by ``db.namespace``. Summed across databases and compared against ``datasette.sql.threads.limit``, this is pool utilisation.
+
+``datasette.write.queue_depth``
+    Writes queued behind a database's single write thread, broken down by ``db.namespace``. Every database serialises all of its writes through one thread, so this is backpressure that raising ``num_sql_threads`` cannot relieve. Not reported for a database that has never been written to.
+
+``datasette.connections.open``
+    Open SQLite file connections currently tracked for closing, broken down by ``db.namespace``.
+
+Query metrics
+~~~~~~~~~~~~~
+
+These are recorded inline as queries run.
+
+``db.client.operation.duration``
+    Histogram of SQL operation durations in seconds.
+
+    Attributes:
+
+    - ``db.system`` - always ``sqlite``
+    - ``db.namespace`` - the database name
+    - ``datasette.operation`` - ``read`` or ``write``
+    - ``error.type`` - the exception class name, present only when the operation failed
+
+    For a write issued with ``block=False`` this measures the enqueue rather than the write itself, matching the behaviour of the surrounding span.
+
+``datasette.write.queue_wait``
+    Histogram, in seconds, of how long each write waited in its database's write queue before the write thread picked it up. The metric counterpart of the ``db.write.queue_wait`` span.
+
+``datasette.sql.queries.interrupted``
+    Counter of queries cancelled for exceeding :ref:`setting_sql_time_limit_ms`, broken down by ``db.namespace``. Worth alerting on: a rising rate means the time limit is too tight or a table has outgrown its queries.
+
+.. note::
+    The three metrics that describe the shared thread pool - ``datasette.sql.threads.limit``, ``datasette.sql.threads.queue_depth`` and the instance as a whole - carry no attribute identifying *which* Datasette produced them. If a single Python process constructs more than one ``Datasette`` instance, their observations collide and the last one collected wins. This does not affect running Datasette normally, where a process serves exactly one instance.
+
 Privacy
 -------
+
+Metrics record no SQL text, no parameter values and no actor information. Their only non-numeric attribute is ``db.namespace``, the database name.
 
 ``db.query.text`` is recorded on every ``db.query`` span, truncated to 2048 characters. **By default SQL parameter values are never recorded** - only ``datasette.param_count``. **Actor identifiers are never recorded** - only ``datasette.actor_present``.
 
@@ -2488,6 +2559,20 @@ Plugins can create their own spans that nest underneath Datasette's by calling `
 Datasette guarantees there is an active tracing context during request handling and inside the SQL worker threads used to execute queries - that context is propagated across every thread boundary Datasette crosses, so a span you start inside a plugin hook nests correctly under the current request even if that hook runs on a different thread.
 
 The one exception is :ref:`plugin_hook_prepare_connection`, which runs during connection warm-up before any request exists. Spans created there have no request to nest under and appear as root spans.
+
+Plugins can record their own metrics the same way, using ``opentelemetry.metrics.get_meter(__name__)``. As with tracing, do not create a ``MeterProvider`` from a plugin - whoever runs Datasette owns that:
+
+.. code-block:: python
+
+    from opentelemetry import metrics
+
+    meter = metrics.get_meter(__name__)
+    lookups = meter.create_counter("my_plugin.lookups")
+
+
+    @hookimpl
+    def render_cell(value, column, table, database, datasette):
+        lookups.add(1, {"db.namespace": database})
 
 .. _internals_csrf:
 
