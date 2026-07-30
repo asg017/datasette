@@ -57,9 +57,9 @@ datasette.render_template                               57.89ms  |       #######
   datasette.hook.extra_body_script                      51.09ms  |       ############################     |
         datasette.plugin = demo-plugin
 
-215 spans total
+125 spans total
   db.query                    : 44
-  datasette.hook.*            : 105
+  datasette.hook.*            : 15
   datasette.permission_check  : 15
   datasette.facet_*           : 6
   datasette.render_template   : 1
@@ -71,7 +71,7 @@ and the response.
 Note: render_cell was dispatched 800 times (100 rows x 8 columns) but produced 1 span, not 800.
 ```
 
-Four things worth looking at in that output:
+Five things worth looking at in that output:
 
 - **The deliberately slow plugin is obvious, and it is nested where it belongs.** `demo-plugin`'s
   `extra_body_script` sleeps for 50ms and owns the waterfall. It is an `async def` implementation, so
@@ -85,9 +85,15 @@ Four things worth looking at in that output:
   span carrying `datasette.hook.call_count`. One span per dispatch would overflow
   `BatchSpanProcessor`'s default 2048-entry queue on a single page and silently drop everything
   else.
-- **Permission checks repeat.** 15 `datasette.permission_check` spans for one page, each fanning out
-  to `permission_resources_sql` hook calls. Repeated sibling spans are collapsed to `xN` lines by
-  the demo's printer, otherwise they bury the rest of the trace. This is meant to look repetitive.
+- **Permission checks repeat.** 15 `datasette.permission_check` spans for one page. Repeated sibling
+  spans are collapsed to `xN` lines by the demo's printer, otherwise they bury the rest of the trace.
+  This is meant to look repetitive — it is the N+1 shape, and `datasette.permission.cached = true`
+  marks the 11 of those 15 that were served from cache and did no work at all.
+- **`permission_resources_sql` is aggregated too.** It is dispatched 16 times per page per
+  implementing plugin — 96 dispatches, which used to be 96 spans and 45% of this trace. It does no
+  I/O (it returns SQL *fragments* that are concatenated into 3 real queries), so per-dispatch spans
+  were measuring the instrumentation. Now it is 6 spans, one per implementation, carrying
+  `datasette.hook.call_count = 16`.
 
 Note the `datasette.facet_suggest` span with ten queries under it: facet *suggestion* probes every
 column and is frequently more expensive than calculating the facets you actually asked for. That is

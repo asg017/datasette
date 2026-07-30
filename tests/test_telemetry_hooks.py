@@ -200,3 +200,106 @@ async def test_hook_spans_are_parented_to_the_surrounding_span(ds_client, otel_s
     ]
     assert len(query) == 1
     assert query[0].parent.span_id == hook[0].context.span_id
+
+
+@pytest.mark.asyncio
+async def test_permission_resources_sql_aggregated_into_one_span_per_plugin(
+    ds_client, otel_spans
+):
+    """
+    The hook that dominated the trace before aggregation.
+
+    It is dispatched once per unique action per implementing plugin, which on a
+    table page meant 96 spans - 45% of the whole trace - for a hook that does no
+    I/O at all: it returns SQL *fragments* that are concatenated into one query
+    per batch. Aggregating collapses those to one span per plugin.
+    """
+    response = await ds_client.get("/fixtures/facetable")
+    assert response.status_code == 200
+
+    spans = hook_spans(otel_spans, "permission_resources_sql")
+    assert spans, "expected at least one permission_resources_sql span"
+
+    # One span per (plugin, function), not one per dispatch.
+    for span in spans:
+        assert span.attributes["datasette.hook.aggregated"] is True
+        assert span.attributes["datasette.hook.call_count"] >= 1
+        assert span.attributes["datasette.hook.total_duration_ms"] >= 0
+
+    # The aggregation has to be doing real work, or this test would pass just as
+    # well with the hook removed from AGGREGATED_HOOKS on a page that happens to
+    # dispatch it once.
+    assert max(s.attributes["datasette.hook.call_count"] for s in spans) > 1
+
+    # One span per (plugin, function). Not per function alone: different
+    # plugins may name their implementation the same thing, and the test
+    # fixtures in this suite do exactly that.
+    keys = [
+        (span.attributes["datasette.plugin"], span.attributes["code.function"])
+        for span in spans
+    ]
+    assert len(keys) == len(
+        set(keys)
+    ), f"expected one span per implementation, got duplicates: {sorted(keys)}"
+
+
+@pytest.mark.asyncio
+async def test_aggregated_hooks_still_emit_spans_outside_a_request(otel_spans):
+    """
+    Aggregation only applies inside a request's window.
+
+    Permission checks also run from CLI paths and plugin code with no request,
+    where there is no window to accumulate into. Those must still produce a span
+    each rather than silently vanishing.
+    """
+    from datasette.app import Datasette
+
+    ds = Datasette(memory=True)
+    ds.add_memory_database("outside_request")
+    await ds.invoke_startup()
+    otel_spans.clear()
+
+    await ds.allowed_resources("view-table", actor=None)
+
+    spans = hook_spans(otel_spans, "permission_resources_sql")
+    assert spans, "permission hooks outside a request must still be traced"
+    for span in spans:
+        assert "datasette.hook.aggregated" not in (span.attributes or {})
+    ds.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_span_duration_is_work_not_window(ds_client, otel_spans):
+    """
+    An aggregate span's duration must be the time spent in the hook, not the
+    span of wall clock between its first and last dispatch.
+
+    This was a real bug: permission_resources_sql fires at the start of a
+    request and again during template rendering, so a first-dispatch-to-last
+    span read 43ms in Jaeger for a hook that consumed 0.04ms - putting it at
+    the top of the "slowest spans" list, which is the first place anyone looks
+    when a page is slow.
+    """
+    response = await ds_client.get("/fixtures/facetable")
+    assert response.status_code == 200
+
+    spans = hook_spans(otel_spans, "permission_resources_sql")
+    assert spans
+
+    for span in spans:
+        duration_ms = (span.end_time - span.start_time) / 1e6
+        total = span.attributes["datasette.hook.total_duration_ms"]
+        window = span.attributes["datasette.hook.window_ms"]
+        assert duration_ms == pytest.approx(total, abs=0.001), (
+            f"span duration {duration_ms:.4f}ms should equal total_duration_ms "
+            f"{total:.4f}ms, not the window"
+        )
+        # The window really is much wider, which is exactly why this matters.
+        assert window >= total
+
+    widest = max(s.attributes["datasette.hook.window_ms"] for s in spans)
+    worked = max(s.attributes["datasette.hook.total_duration_ms"] for s in spans)
+    assert widest > worked * 5, (
+        "expected the dispatches to be genuinely spread across the request - "
+        "if they are not, this test is no longer proving anything"
+    )

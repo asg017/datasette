@@ -2442,14 +2442,15 @@ This reference is generated from ``datasette/telemetry_registry.py``, the single
     - ``datasette.transaction`` - False for statements such as ``VACUUM`` that cannot run inside a transaction.
 
 ``datasette.hook.*``
-    One plugin hook implementation running, named for the hook - for example ``datasette.hook.extra_body_script``. For an ``async def`` implementation the span covers the ``await``, not pluggy's synchronous dispatch. Hooks dispatched per row or per cell are aggregated into one span per request rather than one span per dispatch.
+    One plugin hook implementation running, named for the hook - for example ``datasette.hook.extra_body_script``. For an ``async def`` implementation the span covers the ``await``, not pluggy's synchronous dispatch. A few very high-frequency hooks - currently ``render_cell`` and ``permission_resources_sql`` - are aggregated instead, producing one span per plugin per request carrying ``datasette.hook.call_count`` rather than one span per dispatch. Aggregation applies only inside a request; the same hooks dispatched from CLI or plugin code still get a span each.
 
     Attributes:
 
     - ``datasette.plugin`` - Name of the plugin providing the implementation.
     - ``code.function`` - Name of the implementation function.
     - ``datasette.hook.call_count`` *(optional)* - Number of dispatches represented by an aggregated span.
-    - ``datasette.hook.total_duration_ms`` *(optional)* - Wall time actually spent inside the hook, summed across every dispatch. Differs from the span's own duration, which runs from first dispatch to last and so also covers the work in between.
+    - ``datasette.hook.total_duration_ms`` *(optional)* - Wall time actually spent inside the hook, summed across every dispatch. This is also the aggregate span's own duration - deliberately, so that a hook dispatched at spread-out points does not appear as one long span covering everything that happened between its first and last call.
+    - ``datasette.hook.window_ms`` *(optional)* - First dispatch to last, including everything Datasette did in between. Deliberately not the span's duration - see ``datasette.hook.total_duration_ms``.
     - ``datasette.hook.aggregated`` *(optional)* - True on a span that represents many dispatches rather than one.
 
 ``datasette.permission_check``
