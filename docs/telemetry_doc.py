@@ -20,6 +20,8 @@ def _attribute_lines(cog, attributes):
 
 
 def spans(cog):
+    from opentelemetry.trace import SpanKind
+
     from datasette.telemetry_registry import SPANS
 
     cog.out("\n")
@@ -27,6 +29,11 @@ def spans(cog):
         title = f"{span}*" if span.prefix else str(span)
         cog.out(f"``{title}``\n")
         cog.out(f"    {span.description}\n\n")
+        # INTERNAL is the default and the overwhelming majority of spans -
+        # printing it on every one would be noise. Only the exceptional case,
+        # a real database call, is worth calling out.
+        if span.kind != SpanKind.INTERNAL:
+            cog.out(f"    Kind: ``{span.kind.name}``.\n\n")
         _attribute_lines(cog, span.attributes)
 
 

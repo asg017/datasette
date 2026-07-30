@@ -22,6 +22,8 @@ Three things read this module, which is the point of it existing:
    the generated docs can catch that second case.
 """
 
+from opentelemetry.trace import SpanKind
+
 
 class Attribute(str):
     """
@@ -45,15 +47,22 @@ class Attribute(str):
 class SpanName(str):
     "A span name, carrying its documentation and the attributes it may set."
 
-    __slots__ = ("attributes", "description", "prefix")
+    __slots__ = ("attributes", "description", "kind", "prefix")
 
-    def __new__(cls, name, description, attributes=(), prefix=False):
+    def __new__(
+        cls, name, description, attributes=(), prefix=False, kind=SpanKind.INTERNAL
+    ):
         self = super().__new__(cls, name)
         self.description = description
         self.attributes = tuple(attributes)
         # True for `datasette.hook.` - emitted names have a variable suffix,
         # so the conformance test matches by prefix rather than equality.
         self.prefix = prefix
+        # SpanKind.INTERNAL by default - every span Datasette emits describes
+        # its own internal work. db.query is the one exception: it is a real
+        # database call, so semantic conventions (and trace UIs, which key
+        # their database styling off this) expect SpanKind.CLIENT.
+        self.kind = kind
         return self
 
     def __repr__(self):
@@ -277,6 +286,7 @@ DB_QUERY = SpanName(
         EXECUTESCRIPT,
         EXECUTEMANY,
     ),
+    kind=SpanKind.CLIENT,
 )
 
 DB_QUERY_EXECUTE = SpanName(

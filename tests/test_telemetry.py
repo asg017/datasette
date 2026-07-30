@@ -6,7 +6,7 @@ import sqlite_utils
 
 pytest.importorskip("opentelemetry.sdk")
 
-from opentelemetry.trace import StatusCode
+from opentelemetry.trace import SpanKind, StatusCode
 
 from datasette.database import Database
 from datasette.telemetry import MAX_SQL_LENGTH, SCHEMA_URL, sql_attribute, tracer
@@ -45,6 +45,36 @@ async def test_db_query_span_basic_attributes(ds_client, otel_spans):
     assert span.attributes["datasette.truncated"] is False
     assert isinstance(span.attributes["datasette.time_limit_ms"], int)
     assert span.status.status_code == StatusCode.UNSET
+
+
+@pytest.mark.asyncio
+async def test_db_query_is_client_kind_and_its_execute_child_is_internal(
+    ds_client, otel_spans
+):
+    """
+    db.query is a real database call, so semantic conventions - and trace
+    UIs, which key their database styling off this - expect SpanKind.CLIENT.
+
+    db.query.execute stays INTERNAL: it is Datasette's own decomposition of
+    that one logical query (the in-thread execution), not a second database
+    call, so marking it CLIENT too would make one query look like two to any
+    UI that counts spans by kind.
+
+    Both sides are asserted so this pins the decision, not just the change -
+    a regression that makes every span CLIENT (or every span INTERNAL) would
+    slip past a test that checked only one of the two.
+    """
+    response = await ds_client.get("/fixtures/-/query.json?sql=select+1")
+    assert response.status_code == 200
+
+    spans = otel_spans.get_finished_spans()
+    query_spans = [s for s in spans if s.name == "db.query"]
+    execute_spans = [s for s in spans if s.name == "db.query.execute"]
+    assert query_spans, "expected a db.query span"
+    assert execute_spans, "expected a db.query.execute span"
+
+    assert query_spans[-1].kind == SpanKind.CLIENT
+    assert execute_spans[-1].kind == SpanKind.INTERNAL
 
 
 @pytest.mark.asyncio

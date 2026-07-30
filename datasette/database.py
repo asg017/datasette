@@ -304,7 +304,7 @@ class Database:
                 cursor, return_all=return_all, returning_limit=returning_limit
             )
 
-        with tracer.start_as_current_span(DB_QUERY) as span:
+        with tracer.start_as_current_span(DB_QUERY, kind=DB_QUERY.kind) as span:
             span.set_attribute(DB_SYSTEM, "sqlite")
             span.set_attribute(DB_NAMESPACE, self.name)
             span.set_attribute(DB_QUERY_TEXT, sql_attribute(sql))
@@ -323,7 +323,7 @@ class Database:
         def _inner(conn):
             return conn.executescript(sql)
 
-        with tracer.start_as_current_span(DB_QUERY) as span:
+        with tracer.start_as_current_span(DB_QUERY, kind=DB_QUERY.kind) as span:
             span.set_attribute(DB_SYSTEM, "sqlite")
             span.set_attribute(DB_NAMESPACE, self.name)
             span.set_attribute(DB_QUERY_TEXT, sql_attribute(sql))
@@ -348,7 +348,7 @@ class Database:
 
             return conn.executemany(sql, count_params(params_seq)), count
 
-        with tracer.start_as_current_span(DB_QUERY) as span:
+        with tracer.start_as_current_span(DB_QUERY, kind=DB_QUERY.kind) as span:
             span.set_attribute(DB_SYSTEM, "sqlite")
             span.set_attribute(DB_NAMESPACE, self.name)
             span.set_attribute(DB_QUERY_TEXT, sql_attribute(sql))
@@ -712,6 +712,7 @@ class Database:
         # be honoured - see the comment on the generic handler below.
         with tracer.start_as_current_span(
             DB_QUERY,
+            kind=DB_QUERY.kind,
             record_exception=False,
             set_status_on_exception=False,
         ) as span:
