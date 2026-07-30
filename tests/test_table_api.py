@@ -1174,6 +1174,18 @@ async def test_nocount(ds_client, nocount, expected_count):
 
 
 @pytest.mark.asyncio
+async def test_nocount_nofacet_if_shape_is_object(ds_client, otel_spans):
+    response = await ds_client.get("/fixtures/facetable.json?_shape=object")
+    assert response.status_code == 200
+    queries = [
+        span.attributes.get("db.query.text", "")
+        for span in otel_spans.get_finished_spans()
+        if span.name == "db.query"
+    ]
+    assert not any("count(*)" in q for q in queries)
+
+
+@pytest.mark.asyncio
 async def test_expand_labels(ds_client):
     response = await ds_client.get(
         "/fixtures/facetable.json?_shape=object&_labels=1&_size=2"
