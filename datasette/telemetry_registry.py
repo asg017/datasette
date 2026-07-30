@@ -312,6 +312,20 @@ DB_WRITE_EXECUTE = SpanName(
     (ISOLATED_CONNECTION, TRANSACTION),
 )
 
+STARTUP = SpanName(
+    "datasette.startup",
+    "``invoke_startup()`` running: ``register_events``, ``register_actions``, "
+    "``register_column_types``, ``prepare_jinja2_environment``, internal-database "
+    "schema catalog refresh (including the ``prepare_connection`` warm-up this "
+    "triggers for each database touched for the first time), saved queries, "
+    "column type config and the ``startup`` hook. Runs once per process, before "
+    "any request exists, so without this span every child it creates would be "
+    "its own orphan root trace. A connection warmed later - lazily, the first "
+    "time a *request* touches a new database or thread - nests under that "
+    "request's own span instead, not under this one, since this span has "
+    "already ended by then.",
+)
+
 HOOK = SpanName(
     "datasette.hook.",
     "One plugin hook implementation running, named for the hook - for example "
@@ -393,6 +407,7 @@ SPANS = (
     DB_QUERY_EXECUTE,
     DB_WRITE_QUEUE_WAIT,
     DB_WRITE_EXECUTE,
+    STARTUP,
     HOOK,
     PERMISSION_CHECK,
     ALLOWED_RESOURCES,

@@ -337,6 +337,66 @@ async def test_execute_isolated_fn_immutable_db_context_propagates(
 
 
 @pytest.mark.asyncio
+async def test_invoke_startup_produces_one_trace_not_dozens_of_orphans(otel_spans):
+    """
+    invoke_startup() runs before any request exists: register_events,
+    register_actions, the internal catalog's db.query and db.write.execute
+    spans, and the prepare_connection warm-up each of those triggers the
+    first time a database is touched. None of it has an ambient span to nest
+    under, so each piece used to become its own single- or two-span root
+    trace - around twenty of them per instance, cluttering a trace UI's
+    search results around every real request.
+
+    invoke_startup() now wraps its whole body in one `datasette.startup`
+    span, so all of that - including the prepare_connection spans - lands in
+    a single trace.
+    """
+    from datasette.app import Datasette
+
+    ds = Datasette(memory=True)
+    ds.add_memory_database("otel_startup_orphans_test")
+    otel_spans.clear()
+
+    # No `with tracer.start_as_current_span(...)` around this call - that is
+    # the point. In production invoke_startup() runs from
+    # AsgiRunOnFirstRequest during the ASGI "lifespan" scope, which
+    # opentelemetry-instrumentation-asgi does not wrap in a span, so there is
+    # no ambient span here either.
+    await ds.invoke_startup()
+
+    spans = otel_spans.get_finished_spans()
+    assert spans, "expected invoke_startup() to produce spans"
+
+    trace_ids = {span.context.trace_id for span in spans}
+    assert len(trace_ids) == 1, (
+        f"expected every span from one invoke_startup() call to share a "
+        f"single trace, got {len(trace_ids)} distinct trace_ids across: "
+        f"{sorted(s.name for s in spans)}"
+    )
+
+    startup_spans = [s for s in spans if s.name == "datasette.startup"]
+    assert len(startup_spans) == 1
+    assert startup_spans[0].parent is None, "datasette.startup must be the root"
+
+    prepare_connection_spans = [
+        s for s in spans if s.name == "datasette.hook.prepare_connection"
+    ]
+    assert prepare_connection_spans, (
+        "expected a prepare_connection span from warming up the new "
+        "database's connection during startup"
+    )
+    for span in prepare_connection_spans:
+        assert span.parent is not None, (
+            "prepare_connection must nest under datasette.startup, not "
+            "become its own orphan root"
+        )
+        assert span.attributes["datasette.plugin"]
+        assert span.attributes["code.function"] == "prepare_connection"
+
+    ds.close()
+
+
+@pytest.mark.asyncio
 async def test_block_false_write_spans_can_end_after_parent_closes(
     ds_client, otel_spans
 ):
