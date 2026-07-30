@@ -4,6 +4,16 @@
 Changelog
 =========
 
+.. _v1_0_a38:
+
+1.0a38 (2026-07-29)
+-------------------
+
+Datasette's hand-rolled query tracing mechanism has been replaced with `OpenTelemetry <https://opentelemetry.io/>`__.
+
+- **Removed** the ``?_trace=1`` query string parameter and the ``trace_debug`` setting. The ``datasette.tracer`` module and its public API - ``trace()``, ``trace_child_tasks()`` and friends - are gone entirely. Plugins that depended on this mechanism, notably `datasette-pretty-traces <https://github.com/simonw/datasette-pretty-traces>`__, will break and need to be updated or removed.
+- **Added** OpenTelemetry span emission across the database layer, plugin hook dispatch and permission checks. Datasette core only depends on ``opentelemetry-api`` and never installs an SDK provider itself, so this has no effect and no overhead unless tracing is activated externally, using the standard ``opentelemetry-instrument`` agent or a host application that installs its own provider. See :ref:`internals_telemetry` for full details, including how to reproduce the old ``?_trace=1`` debugging workflow using a console exporter.
+
 .. _v1_0_a37:
 
 1.0a37 (2026-07-14)
@@ -1140,7 +1150,7 @@ Datasette also now requires Python 3.7 or higher.
 - ``sqlite_stat`` tables are now hidden by default. (:issue:`1587`)
 - SpatiaLite tables ``data_licenses``, ``KNN`` and ``KNN2`` are now hidden by default. (:issue:`1601`)
 - SQL query tracing mechanism now works for queries executed in ``asyncio`` sub-tasks, such as those created by ``asyncio.gather()``. (:issue:`1576`)
-- :ref:`internals_tracer` mechanism is now documented.
+- ``datasette.tracer`` mechanism is now documented.
 - Common Datasette symbols can now be imported directly from the top-level ``datasette`` package, see :ref:`internals_shortcuts`. Those symbols are ``Response``, ``Forbidden``, ``NotFound``, ``hookimpl``, ``actor_matches_allow``. (:issue:`957`)
 - ``/-/versions`` page now returns additional details for libraries used by SpatiaLite. (:issue:`1607`)
 - Documentation now links to the `Datasette Tutorials <https://datasette.io/tutorials>`__.
@@ -1306,7 +1316,7 @@ New features
 - ``?_facet_size=max`` sets that to the maximum, which defaults to 1,000 and is controlled by the the :ref:`setting_max_returned_rows` setting. If facet results are truncated the … at the bottom of the facet list now links to this parameter. (:issue:`1337`)
 - ``?_nofacet=1`` option to disable all facet calculations on a page, used as a performance optimization for CSV exports and ``?_shape=array/object``. (:issue:`1349`, :issue:`263`)
 - ``?_nocount=1`` option to disable full query result counts. (:issue:`1353`)
-- ``?_trace=1`` debugging option is now controlled by the new :ref:`setting_trace_debug` setting, which is turned off by default. (:issue:`1359`)
+- ``?_trace=1`` debugging option is now controlled by the new ``trace_debug`` setting, which is turned off by default. (:issue:`1359`)
 
 Bug fixes and other improvements
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

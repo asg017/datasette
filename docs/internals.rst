@@ -2313,6 +2313,178 @@ The ``Database`` class also provides properties and methods for introspecting th
           }
         }
 
+.. _internals_telemetry:
+
+OpenTelemetry tracing
+=====================
+
+Datasette core depends on `opentelemetry-api <https://pypi.org/project/opentelemetry-api/>`__ only. It never creates a ``TracerProvider``, never configures an exporter and never sets a sampler. With no OpenTelemetry SDK provider installed, every span described on this page is a no-op ``NonRecordingSpan`` - the overhead is close to zero and nothing is recorded or exported anywhere.
+
+Turning tracing on is entirely an operational decision made outside of Datasette itself: run Datasette under the standard ``opentelemetry-instrument`` agent, or embed Datasette inside a host application that installs its own ``TracerProvider``.
+
+Turning tracing on
+------------------
+
+Install an ASGI instrumentation package and an exporter, then launch Datasette through ``opentelemetry-instrument``:
+
+.. code-block:: bash
+
+    pip install opentelemetry-instrumentation-asgi opentelemetry-exporter-otlp
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+    OTEL_SERVICE_NAME=datasette \
+    OTEL_METRICS_EXPORTER=none \
+    OTEL_LOGS_EXPORTER=none \
+      opentelemetry-instrument datasette mydb.db
+
+This exports spans over OTLP to a collector listening on ``localhost:4317`` - point ``OTEL_EXPORTER_OTLP_ENDPOINT`` at whichever tracing backend you use.
+
+Always set ``OTEL_SERVICE_NAME``. Without it the OpenTelemetry SDK falls back to ``unknown_service:<executable>``, and your traces will be filed under that name rather than under ``datasette``.
+
+Set ``OTEL_METRICS_EXPORTER=none`` and ``OTEL_LOGS_EXPORTER=none`` unless your backend accepts those signals too. ``opentelemetry-distro`` defaults every signal to OTLP, and a traces-only backend such as Jaeger will reject the others with a repeating ``StatusCode.UNIMPLEMENTED`` / ``unknown service ...MetricsService`` error. Tracing is unaffected, but the log noise is considerable.
+
+Datasette's spans nest correctly among themselves, but nothing in core creates a span for the HTTP request itself, so by default every span is a root span - which a tracing UI displays as dozens of unrelated single-span traces per page. To get one trace per request, wrap Datasette's ASGI app using the :ref:`plugin_asgi_wrapper` hook:
+
+.. code-block:: python
+
+    from opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware
+
+    from datasette import hookimpl
+
+
+    @hookimpl
+    def asgi_wrapper(datasette):
+        def wrap(app):
+            return OpenTelemetryMiddleware(app)
+
+        return wrap
+
+``demos/otel/plugins/otel_asgi.py`` in the Datasette repository contains exactly this plugin, ready to load with ``--plugins-dir``.
+
+Local debugging
+---------------
+
+To print spans straight to your terminal, without running a collector, install the OpenTelemetry distro and use the console exporter:
+
+.. code-block:: bash
+
+    pip install opentelemetry-distro opentelemetry-instrumentation
+    OTEL_TRACES_EXPORTER=console OTEL_METRICS_EXPORTER=none OTEL_LOGS_EXPORTER=none \
+      opentelemetry-instrument datasette mydb.db
+
+This is the replacement for the removed ``?_trace=1`` query string parameter. It works differently, not just under a different name: spans are printed to the terminal that is running Datasette rather than embedded in the HTML response, and it is not scoped to a single request - every request handled by that process will be traced for as long as it keeps running.
+
+Setting ``OTEL_TRACES_EXPORTER=console`` against a plain ``datasette`` process does nothing. That environment variable is read by the OpenTelemetry SDK's auto-configuration, which only runs when the ``opentelemetry-instrument`` agent wraps the process - Datasette core never installs an SDK provider to read it itself.
+
+The default ``BatchSpanProcessor`` buffers spans before writing them out, so output can take up to ten seconds to appear after a request completes. Give it a few seconds, or stop the process, which triggers a final flush.
+
+Span reference
+--------------
+
+The spans below were captured by running instrumented requests and recording every span name together with its attribute keys. Attribute names use the ``datasette.*`` prefix for Datasette-specific data, alongside standard OpenTelemetry attributes such as ``db.system``.
+
+``db.query``
+    One span per logical query.
+
+    Attributes:
+
+    - ``db.system`` - always ``sqlite``
+    - ``db.namespace`` - the database name
+    - ``db.query.text`` - the SQL text, truncated to 2048 characters
+    - ``datasette.rows_returned``
+    - ``datasette.truncated``
+    - ``datasette.time_limit_ms``
+    - ``datasette.param_count`` - a **count** of bound parameters, never their values
+    - ``datasette.executemany`` - present only on ``execute_write_many``
+    - ``datasette.executescript`` - present only on ``execute_write_script``
+    - ``datasette.interrupted`` - present only when a query hits the time limit; the span status is also set to ``ERROR`` when this happens
+
+``db.query.execute``
+    The read executed inside a SQL worker thread. Child of ``db.query``. No attributes.
+
+``db.write.queue_wait``
+    Time a write spent waiting in the per-database write queue before the write thread picked it up. Child of ``db.query``. No attributes.
+
+``db.write.execute``
+    The write executing on the write thread. Child of ``db.query``.
+
+    Attributes:
+
+    - ``datasette.isolated_connection``
+    - ``datasette.transaction``
+
+``datasette.hook.<hook_name>``
+    One span per plugin hook implementation dispatched, for example ``datasette.hook.permission_resources_sql``.
+
+    Attributes:
+
+    - ``datasette.plugin`` - the plugin name
+    - ``code.function`` - the implementation function name
+
+    Per-cell hooks (``render_cell``) are aggregated into one span per request instead of one span per cell. That aggregated span additionally carries:
+
+    - ``datasette.hook.aggregated`` - ``true``
+    - ``datasette.hook.call_count``
+    - ``datasette.hook.total_duration_ms``
+
+``datasette.permission_check``
+    Wraps ``allowed_many()``, the choke point behind :ref:`datasette.allowed() <datasette_allowed>`, :ref:`datasette.ensure_permission() <datasette_ensure_permission>` and :ref:`datasette.check_visibility() <datasette_check_visibility>`.
+
+    Attributes:
+
+    - ``datasette.action`` - single-action calls
+    - ``datasette.actions`` - multi-action calls
+    - ``datasette.result`` - single-action calls only
+    - ``datasette.resource`` - omitted when there is no resource
+    - ``datasette.actor_present``
+    - ``datasette.permission.cached``
+
+``datasette.allowed_resources``
+    Wraps :ref:`datasette.allowed_resources() <datasette_allowed_resources>`, the bulk resource-listing path.
+
+    Attributes:
+
+    - ``datasette.action``
+    - ``datasette.resource`` - omitted when there is no parent filter
+    - ``datasette.actor_present``
+    - ``datasette.resources_returned``
+
+``datasette.permission_resources_sql``
+    Wraps :ref:`datasette.allowed_resources_sql() <datasette_allowed_resources_sql>`, the SQL-building and hook-gathering phase nested inside ``datasette.allowed_resources``.
+
+    Attributes:
+
+    - ``datasette.action``
+    - ``datasette.resource`` - omitted when there is no parent filter
+    - ``datasette.actor_present``
+
+Privacy
+-------
+
+``db.query.text`` is recorded on every ``db.query`` span, truncated to 2048 characters. **SQL parameter values are never recorded** - only ``datasette.param_count``. **Actor identifiers are never recorded** - only ``datasette.actor_present``.
+
+If you export spans to a third-party tracing vendor, keep in mind that on a public Datasette instance the SQL text is user-supplied: anything visitors type into the query editor or pass as ``?sql=`` will leave your infrastructure as part of ``db.query.text``.
+
+For plugin authors
+------------------
+
+Plugins can create their own spans that nest underneath Datasette's by calling ``opentelemetry.trace.get_tracer(__name__)`` directly and starting spans as normal:
+
+.. code-block:: python
+
+    from opentelemetry import trace
+
+    tracer = trace.get_tracer(__name__)
+
+
+    @hookimpl
+    def render_cell(value, column, table, database, datasette):
+        with tracer.start_as_current_span("my_plugin.render_cell"):
+            ...
+
+Datasette guarantees there is an active tracing context during request handling and inside the SQL worker threads used to execute queries - that context is propagated across every thread boundary Datasette crosses, so a span you start inside a plugin hook nests correctly under the current request even if that hook runs on a different thread.
+
+The one exception is :ref:`plugin_hook_prepare_connection`, which runs during connection warm-up before any request exists. Spans created there have no request to nest under and appear as root spans.
+
 .. _internals_csrf:
 
 CSRF protection
