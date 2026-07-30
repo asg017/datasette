@@ -205,9 +205,19 @@ async def test_every_non_optional_attribute_is_emitted(emitted):
     )
 
 
-@pytest.mark.asyncio
-async def test_every_registered_metric_is_emitted(otel_metrics):
-    "The same both-ways check for metrics."
+@pytest_asyncio.fixture
+async def emitted_metrics(otel_metrics):
+    """
+    Every (metric name, attribute key) pair produced by a broad set of
+    requests, plus the raw set of metric names - the metric-side counterpart
+    of the `emitted` span fixture above.
+
+    Metrics use DELTA temporality (see `_otel_meter_provider`), and the
+    function-scoped `otel_metrics` fixture drains any state left by an
+    earlier test before yielding, so this collection is not polluted by
+    other tests in the session - only by other *instances*, which is why the
+    checks below key everything off attribute names rather than values.
+    """
     ds, name = await build("registry_metrics")
     await exercise(ds, name)
     await exercise_facet_timeout()
@@ -223,16 +233,95 @@ async def test_every_registered_metric_is_emitted(otel_metrics):
         )
 
     otel_metrics.collect()
-    emitted = set(otel_metrics.snapshot)
-    missing = sorted(str(m) for m in reg.METRICS if m not in emitted)
+    snapshot = otel_metrics.snapshot
+    assert snapshot, "no metrics captured - the fixture is not exercising anything"
+    pairs = set()
+    for metric_name, points in snapshot.items():
+        for point in points:
+            for key in point.attributes or {}:
+                pairs.add((metric_name, key))
+    ds.close()
+    slow.close()
+    return {"names": set(snapshot), "pairs": pairs}
+
+
+@pytest.mark.asyncio
+async def test_every_registered_metric_is_emitted(emitted_metrics):
+    "The same both-ways check for metrics, by name."
+    names = emitted_metrics["names"]
+    missing = sorted(str(m) for m in reg.METRICS if m not in names)
     assert not missing, f"documented but never emitted: {missing}"
 
     unregistered = sorted(
-        name for name in emitted if name not in {str(m) for m in reg.METRICS}
+        name for name in names if name not in {str(m) for m in reg.METRICS}
     )
     assert not unregistered, f"emitted but not registered: {unregistered}"
-    ds.close()
-    slow.close()
+
+
+@pytest.mark.asyncio
+async def test_every_emitted_metric_attribute_is_registered(emitted_metrics):
+    """
+    An attribute added to a metric without a registry entry would be missing
+    from the docs - the metric-side counterpart of
+    `test_every_emitted_attribute_is_registered`.
+    """
+    metric_for = {str(m): m for m in reg.METRICS}
+    unregistered = sorted(
+        f"{metric_name} -> {key}"
+        for metric_name, key in emitted_metrics["pairs"]
+        # A metric name with no registry entry at all is already reported by
+        # test_every_registered_metric_is_emitted; do not double-report it
+        # here, and do not crash attribute_allowed() on a None metric.
+        if metric_name in metric_for
+        and not reg.attribute_allowed(metric_for[metric_name], key)
+    )
+    assert (
+        not unregistered
+    ), "these metric attributes are emitted but not registered: " + "\n".join(
+        unregistered
+    )
+
+
+@pytest.mark.asyncio
+async def test_every_registered_metric_attribute_is_emitted(emitted_metrics):
+    """
+    The direction nothing else catches: the docs must not describe a metric
+    attribute that no longer exists - the metric-side counterpart of
+    `test_every_registered_span_is_emitted` / `test_every_non_optional_attribute_is_emitted`.
+
+    Unlike the span-side attribute check, this does not skip `optional`
+    attributes. The only optional metric attribute is `error.type` on
+    `db.client.operation.duration`, present only when the operation fails,
+    and the workload reaches it from three independent directions: the
+    suppressed-error probe in `exercise()`, the interrupted query below, and
+    facet suggestion probing columns that do not support the facet. Removing
+    any one of them - or even the first two together - leaves it emitted,
+    which was confirmed by deleting them and watching this test still pass.
+    So it is checked like any other attribute rather than exempted; marking
+    something optional here would opt it out of verification entirely.
+
+    Gauges with no registered attributes (`datasette.sql.threads.limit` and
+    `.queue_depth`) fall out correctly with no special case: their
+    `metric.attributes` is empty, so the inner loop makes no assertion.
+    """
+    emitted_keys_by_metric = {}
+    for metric_name, key in emitted_metrics["pairs"]:
+        emitted_keys_by_metric.setdefault(metric_name, set()).add(key)
+
+    missing = []
+    for metric in reg.METRICS:
+        if str(metric) not in emitted_metrics["names"]:
+            # Not emitted at all - already reported by
+            # test_every_registered_metric_is_emitted; do not double-report.
+            continue
+        emitted_keys = emitted_keys_by_metric.get(str(metric), set())
+        for attribute in metric.attributes:
+            if attribute not in emitted_keys:
+                missing.append(f"{metric} -> {attribute}")
+    assert not missing, (
+        "these metric attributes are documented but never emitted by the "
+        "test workload: " + ", ".join(sorted(missing))
+    )
 
 
 # There is deliberately no test that a metric's unit matches the registry.
