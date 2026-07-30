@@ -44,26 +44,43 @@ datasette.permission_check                               0.37ms  |#             
         db.query.text = WITH a0_rules AS ( SELECT parent, child, allow, reason,...
     db.query.execute                                     0.08ms  |#                                       |
 ...
+datasette.facet_suggest                                  3.97ms  |  ##                                    |
+      datasette.facet_type = column
+  db.query  x10                                          3.82ms  |  ##                                    |
+...
 datasette.hook.render_cell                               1.44ms  |  #                                     |
       datasette.plugin = demo-plugin
       datasette.hook.call_count = 800
 ...
-datasette.hook.extra_body_script                        51.11ms  |       ############################### |
-      datasette.plugin = demo-plugin
+datasette.render_template                               57.89ms  |       ################################ |
+      datasette.template = table.html
+  datasette.hook.extra_body_script                      51.09ms  |       ############################     |
+        datasette.plugin = demo-plugin
 
-208 spans total
+215 spans total
   db.query                    : 44
   datasette.hook.*            : 105
   datasette.permission_check  : 15
+  datasette.facet_*           : 6
+  datasette.render_template   : 1
+
+Template rendering took 57.9ms of this request. Before that
+span existed it was an unexplained gap between the last query
+and the response.
 
 Note: render_cell was dispatched 800 times (100 rows x 8 columns) but produced 1 span, not 800.
 ```
 
-Three things worth looking at in that output:
+Four things worth looking at in that output:
 
-- **The deliberately slow plugin is obvious.** `demo-plugin`'s `extra_body_script` sleeps for 50ms
-  and owns the waterfall. It is an `async def` implementation, so the span covers the `await` rather
-  than pluggy's synchronous dispatch — which is the only reason it reads as 51ms instead of 0ms.
+- **The deliberately slow plugin is obvious, and it is nested where it belongs.** `demo-plugin`'s
+  `extra_body_script` sleeps for 50ms and owns the waterfall. It is an `async def` implementation, so
+  the span covers the `await` rather than pluggy's synchronous dispatch — which is the only reason it
+  reads as 51ms instead of 0ms. It appears *inside* `datasette.render_template`, because that is
+  genuinely when it runs: the hook is awaited while the template context is being built.
+- **`datasette.render_template` accounts for the tail of the request.** 57.9ms of a request whose
+  queries total a couple of milliseconds. Without this span that time is a gap in the trace, which is
+  the least useful shape a trace can have — it tells you where the time is *not*.
 - **`render_cell` is aggregated.** It was dispatched once per cell, 800 times, but produces a single
   span carrying `datasette.hook.call_count`. One span per dispatch would overflow
   `BatchSpanProcessor`'s default 2048-entry queue on a single page and silently drop everything
@@ -71,6 +88,10 @@ Three things worth looking at in that output:
 - **Permission checks repeat.** 15 `datasette.permission_check` spans for one page, each fanning out
   to `permission_resources_sql` hook calls. Repeated sibling spans are collapsed to `xN` lines by
   the demo's printer, otherwise they bury the rest of the trace. This is meant to look repetitive.
+
+Note the `datasette.facet_suggest` span with ten queries under it: facet *suggestion* probes every
+column and is frequently more expensive than calculating the facets you actually asked for. That is
+what `?_nosuggest=1` and the `suggest_facets` setting turn off.
 
 Writes are not exercised here because this is a read-only page. Hitting a write endpoint adds
 `db.write.queue_wait` and `db.write.execute` spans as children of `db.query`, which is how you tell

@@ -14,6 +14,7 @@ from datasette.extras import ExtraScope, extra_names_from_request
 from datasette.plugins import pm
 from datasette.resources import DatabaseResource, QueryResource
 from datasette.stored_queries import StoredQuery, stored_query_to_dict
+from datasette.telemetry import tracer
 from datasette.utils import (
     InvalidSql,
     add_cors_headers,
@@ -887,25 +888,28 @@ class QueryView(View):
                 data.update(await resolve_query_extras(extras, query_extra_context))
             # Dispatch request to the correct output format renderer
             # (CSV is not handled here due to streaming)
-            result = call_with_supported_arguments(
-                datasette.renderers[format_][0],
-                datasette=datasette,
-                columns=columns,
-                rows=rows,
-                sql=sql,
-                query_name=stored_query.name if stored_query else None,
-                database=database,
-                table=None,
-                request=request,
-                view_name="table",
-                truncated=results.truncated if results else False,
-                error=query_error,
-                # These will be deprecated in Datasette 1.0:
-                args=request.args,
-                data=data,
-            )
-            if asyncio.iscoroutine(result):
-                result = await result
+            with tracer.start_as_current_span("datasette.render") as span:
+                span.set_attribute("datasette.format", format_)
+                span.set_attribute("datasette.rows_returned", len(rows))
+                result = call_with_supported_arguments(
+                    datasette.renderers[format_][0],
+                    datasette=datasette,
+                    columns=columns,
+                    rows=rows,
+                    sql=sql,
+                    query_name=stored_query.name if stored_query else None,
+                    database=database,
+                    table=None,
+                    request=request,
+                    view_name="table",
+                    truncated=results.truncated if results else False,
+                    error=query_error,
+                    # These will be deprecated in Datasette 1.0:
+                    args=request.args,
+                    data=data,
+                )
+                if asyncio.iscoroutine(result):
+                    result = await result
             if result is None:
                 raise NotFound("No data")
             if isinstance(result, dict):

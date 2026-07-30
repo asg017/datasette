@@ -53,6 +53,7 @@ from .telemetry import (
     TRACE_SQL_PARAMETER_MODES,
     aggregate_hook_spans,
     register_datasette,
+    template_render_duration,
     tracer,
     unregister_datasette,
 )
@@ -2431,6 +2432,37 @@ class Datasette:
         request: Request | None = None,
         view_name: str | None = None,
     ):
+        # The body lives in _render_template so that the span covers template
+        # selection and context building as well as the render itself - those
+        # await plugin hooks and asset URL resolution, and a span that started
+        # at render_async() would leave that time in an unexplained gap.
+        with tracer.start_as_current_span("datasette.render_template") as span:
+            if view_name:
+                span.set_attribute("datasette.view_name", view_name)
+            # Which template gets selected is only known partway through the
+            # body, so it is carried back out here rather than stored on self,
+            # which concurrent requests would race on.
+            selected = {}
+            started = time.perf_counter()
+            try:
+                return await self._render_template(
+                    templates, context, request, view_name, span, selected
+                )
+            finally:
+                template_render_duration.record(
+                    time.perf_counter() - started,
+                    {"datasette.template": selected.get("template", "unknown")},
+                )
+
+    async def _render_template(
+        self,
+        templates,
+        context,
+        request,
+        view_name,
+        span,
+        selected,
+    ):
         if not self._startup_invoked:
             raise RuntimeError(
                 "render_template() called before await ds.invoke_startup()"
@@ -2442,6 +2474,10 @@ class Datasette:
             if isinstance(templates, str):
                 templates = [templates]
             template = self.get_jinja_environment(request).select_template(templates)
+        # A Template built with from_string() has no name.
+        template_name = template.name or "<string>"
+        selected["template"] = template_name
+        span.set_attribute("datasette.template", template_name)
         if dataclasses.is_dataclass(context):
             # Shallow conversion - asdict() would deep-copy values, which
             # is wasteful and fails on values like sqlite3.Row

@@ -2473,6 +2473,52 @@ The spans below were captured by running instrumented requests and recording eve
     - ``datasette.resource`` - omitted when there is no parent filter
     - ``datasette.actor_present``
 
+Response building
+~~~~~~~~~~~~~~~~~
+
+Everything above happens before the response body exists. These spans cover what happens after the SQL finishes - without them, a slow page whose queries are all fast produces a trace of quick ``db.query`` spans followed by a large unexplained gap.
+
+``datasette.render_template``
+    Rendering a Jinja template into an HTML response. Covers template selection and context building as well as the render itself, so the plugin hooks awaited while building the context (``extra_template_vars``, ``extra_body_script`` and the asset URL hooks) nest inside it.
+
+    Attributes:
+
+    - ``datasette.template`` - the selected template name, or ``<string>`` for a template built with ``from_string()``
+    - ``datasette.view_name`` - omitted when the caller did not supply one
+
+``datasette.facet_results``
+    One facet class calculating its results. The SQL it runs nests inside it.
+
+    Attributes:
+
+    - ``datasette.facet_type`` - ``column``, ``array`` or ``date``
+
+``datasette.facet_suggest``
+    One facet class deciding which facets to suggest, controlled by :ref:`setting_suggest_facets`. Often more expensive than the facets themselves, because suggestion probes every column.
+
+    Attributes:
+
+    - ``datasette.facet_type``
+
+``datasette.render``
+    Dispatch to an output renderer - ``json``, or any format registered by the :ref:`plugin_register_output_renderer` hook. CSV is not included here, since it streams.
+
+    Attributes:
+
+    - ``datasette.format``
+    - ``datasette.rows_returned``
+
+``datasette.csv_stream``
+    Writing a CSV response body. This runs *after* the view has returned, while the body is being sent, and for a ``?_stream=1`` export it is where nearly all of the request's time goes.
+
+    Attributes:
+
+    - ``datasette.stream`` - true if this is a full ``?_stream=1`` export rather than a single page
+    - ``db.namespace``
+    - ``datasette.table`` - omitted for query pages
+    - ``datasette.rows_written``
+    - ``datasette.pages_fetched`` - more than one only when streaming
+
 Metrics reference
 -----------------
 
@@ -2522,6 +2568,21 @@ These are recorded inline as queries run.
 
 ``datasette.sql.queries.interrupted``
     Counter of queries cancelled for exceeding :ref:`setting_sql_time_limit_ms`, broken down by ``db.namespace``. Worth alerting on: a rising rate means the time limit is too tight or a table has outgrown its queries.
+
+Response building metrics
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``datasette.template.render.duration``
+    Histogram, in seconds, of time spent in :ref:`datasette_render_template`, broken down by ``datasette.template``. Template names are bounded by the templates that exist, so this is safe to break down by.
+
+``datasette.facet.duration``
+    Histogram, in seconds, of time spent on one facet, broken down by ``datasette.facet_type`` and ``datasette.facet_phase`` (``results`` or ``suggest``). Suggestion and calculation have very different costs and are worth separating.
+
+``datasette.facets.timed_out``
+    Counter of facet calculations abandoned for exceeding :ref:`setting_facet_time_limit_ms`, broken down by ``datasette.facet_type``. A timed-out facet is dropped from the page silently, so without this metric the failure is invisible.
+
+``datasette.csv.rows_streamed``
+    Counter of rows written to CSV responses. The throughput measure for exports.
 
 .. note::
     The three metrics that describe the shared thread pool - ``datasette.sql.threads.limit``, ``datasette.sql.threads.queue_depth`` and the instance as a whole - carry no attribute identifying *which* Datasette produced them. If a single Python process constructs more than one ``Datasette`` instance, their observations collide and the last one collected wins. This does not affect running Datasette normally, where a process serves exactly one instance.

@@ -2,6 +2,7 @@ import csv
 import hashlib
 import sys
 
+from datasette.telemetry import record_csv_rows, tracer
 from datasette.utils import (
     EscapeHtmlWriter,
     InvalidSql,
@@ -239,6 +240,28 @@ async def stream_csv(datasette, fetch_data, request, database):
 
     async def stream_fn(r):
         nonlocal data, trace
+        # This runs while the response body is being sent, after the view has
+        # returned. For a ?_stream=1 export it is where nearly all of the
+        # request's time goes, and without a span it is invisible: the trace
+        # shows a handful of fast db.query spans and then nothing.
+        with tracer.start_as_current_span("datasette.csv_stream") as span:
+            span.set_attribute("datasette.stream", bool(stream))
+            span.set_attribute("db.namespace", database)
+            if data.get("table"):
+                span.set_attribute("datasette.table", data["table"])
+            rows_written = 0
+            pages_fetched = 1
+            try:
+                rows_written, pages_fetched = await _stream_csv_rows(r)
+            finally:
+                span.set_attribute("datasette.rows_written", rows_written)
+                span.set_attribute("datasette.pages_fetched", pages_fetched)
+                record_csv_rows(rows_written)
+
+    async def _stream_csv_rows(r):
+        nonlocal data, trace
+        rows_written = 0
+        pages_fetched = 1
         limited_writer = LimitedWriter(r, datasette.setting("max_csv_mb"))
         if trace:
             await limited_writer.write(preamble)
@@ -254,6 +277,7 @@ async def stream_csv(datasette, fetch_data, request, database):
                     kwargs["_next"] = next
                 if not first:
                     data, _, _ = await fetch_data(request, **kwargs)
+                    pages_fetched += 1
                 if first:
                     if request.args.get("_header") != "off":
                         await writer.writerow(headings)
@@ -297,6 +321,7 @@ async def stream_csv(datasette, fetch_data, request, database):
                                     )
                             new_row.append(cell)
                         row = new_row
+                    rows_written += 1
                     if not expanded_columns:
                         # Simple path
                         await writer.writerow(row)
@@ -321,8 +346,9 @@ async def stream_csv(datasette, fetch_data, request, database):
                 sys.stderr.write(f"Caught this error: {ex}\n")
                 sys.stderr.flush()
                 await r.write(str(ex))
-                return
+                return rows_written, pages_fetched
         await limited_writer.write(postamble)
+        return rows_written, pages_fetched
 
     headers = {}
     if datasette.cors:

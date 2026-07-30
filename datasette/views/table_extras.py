@@ -7,6 +7,7 @@ from datasette.database import QueryInterrupted
 from datasette.extras import Extra, ExtraExample, ExtraRegistry, ExtraScope, Provider
 from datasette.plugins import pm
 from datasette.resources import DatabaseResource, TableResource
+from datasette.telemetry import record_facets_timed_out, traced_facet
 from datasette.utils import (
     await_me_maybe,
     call_with_supported_arguments,
@@ -224,12 +225,24 @@ class FacetResultsExtra(Extra):
         facets_timed_out = []
 
         if not context.nofacet:
-            facet_awaitables = [facet.facet_results() for facet in facet_instances]
+            facet_awaitables = [
+                traced_facet(
+                    "datasette.facet_results",
+                    facet.type,
+                    "results",
+                    facet.facet_results(),
+                )
+                for facet in facet_instances
+            ]
             facet_awaitable_results = await context.run_sequential(*facet_awaitables)
-            for (
+            for facet, (
                 instance_facet_results,
                 instance_facets_timed_out,
-            ) in facet_awaitable_results:
+            ) in zip(facet_instances, facet_awaitable_results):
+                # Facet timeouts are a rate worth alerting on: they mean
+                # facet_time_limit_ms is being hit, and the page silently
+                # renders without those facets.
+                record_facets_timed_out(facet.type, len(instance_facets_timed_out))
                 for facet_info in instance_facet_results:
                     base_key = facet_info["name"]
                     key = base_key
@@ -290,7 +303,12 @@ class SuggestedFacetsExtra(Extra):
             and not context.nofacet
             and not context.nosuggest
         ):
-            facet_suggest_awaitables = [facet.suggest() for facet in facet_instances]
+            facet_suggest_awaitables = [
+                traced_facet(
+                    "datasette.facet_suggest", facet.type, "suggest", facet.suggest()
+                )
+                for facet in facet_instances
+            ]
             for suggest_result in await context.run_sequential(
                 *facet_suggest_awaitables
             ):
