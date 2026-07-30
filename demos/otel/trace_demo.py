@@ -105,6 +105,10 @@ def print_tree(spans):
         "datasette.action",
         "datasette.hook.call_count",
         "datasette.rows_returned",
+        "datasette.template",
+        "datasette.facet_type",
+        "datasette.format",
+        "datasette.rows_written",
     )
 
     def bar_for(start, end):
@@ -194,6 +198,20 @@ async def main():
     print(
         f"  datasette.permission_check  : {names.count('datasette.permission_check')}"
     )
+    print(
+        f"  datasette.facet_*           : {sum(1 for n in names if n.startswith('datasette.facet_'))}"
+    )
+    print(f"  datasette.render_template   : {names.count('datasette.render_template')}")
+    render_template = [
+        span for span in spans if span.name == "datasette.render_template"
+    ]
+    if render_template:
+        ms = (render_template[0].end_time - render_template[0].start_time) / 1e6
+        print(
+            f"\nTemplate rendering took {ms:.1f}ms of this request. Before that "
+            f"\nspan existed it was an unexplained gap between the last query "
+            f"\nand the response."
+        )
     render_cell = [span for span in spans if span.name == "datasette.hook.render_cell"]
     if render_cell:
         count = render_cell[0].attributes.get("datasette.hook.call_count")

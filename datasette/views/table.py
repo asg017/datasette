@@ -20,6 +20,7 @@ from datasette.extras import ExtraScope, extra_names_from_request
 from datasette.filters import Filters
 from datasette.plugins import pm
 from datasette.resources import DatabaseResource, TableResource
+from datasette.telemetry import tracer
 from datasette.utils import (
     CustomJSONEncoder,
     CustomRow,
@@ -1775,25 +1776,28 @@ async def table_view_traced(datasette, request):
     elif format_ in datasette.renderers:
         # Dispatch request to the correct output format renderer
         # (CSV is not handled here due to streaming)
-        result = call_with_supported_arguments(
-            datasette.renderers[format_][0],
-            datasette=datasette,
-            columns=columns,
-            rows=rows,
-            sql=sql,
-            query_name=None,
-            database=resolved.db.name,
-            table=resolved.table,
-            request=request,
-            view_name="table",
-            truncated=False,
-            error=None,
-            # These will be deprecated in Datasette 1.0:
-            args=request.args,
-            data=data,
-        )
-        if asyncio.iscoroutine(result):
-            result = await result
+        with tracer.start_as_current_span("datasette.render") as span:
+            span.set_attribute("datasette.format", format_)
+            span.set_attribute("datasette.rows_returned", len(rows))
+            result = call_with_supported_arguments(
+                datasette.renderers[format_][0],
+                datasette=datasette,
+                columns=columns,
+                rows=rows,
+                sql=sql,
+                query_name=None,
+                database=resolved.db.name,
+                table=resolved.table,
+                request=request,
+                view_name="table",
+                truncated=False,
+                error=None,
+                # These will be deprecated in Datasette 1.0:
+                args=request.args,
+                data=data,
+            )
+            if asyncio.iscoroutine(result):
+                result = await result
         if result is None:
             raise NotFound("No data")
         if isinstance(result, dict):

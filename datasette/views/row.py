@@ -13,6 +13,7 @@ from datasette.events import DeleteRowEvent, UpdateRowEvent
 from datasette.extras import ExtraScope, extra_names_from_request
 from datasette.plugins import pm
 from datasette.resources import TableResource
+from datasette.telemetry import tracer
 from datasette.utils import (
     CustomJSONEncoder,
     CustomRow,
@@ -217,25 +218,30 @@ class RowView(BaseView):
         if format_ in self.ds.renderers:
             # Dispatch request to the correct output format renderer
             # (CSV is not handled here due to streaming)
-            result = call_with_supported_arguments(
-                self.ds.renderers[format_][0],
-                datasette=self.ds,
-                columns=data.get("columns") or [],
-                rows=data.get("rows") or [],
-                sql=data.get("query", {}).get("sql", None),
-                query_name=data.get("query_name"),
-                database=database,
-                table=data.get("table"),
-                request=request,
-                view_name=self.name,
-                truncated=False,  # TODO: support this
-                error=data.get("error"),
-                # These will be deprecated in Datasette 1.0:
-                args=request.args,
-                data=data,
-            )
-            if asyncio.iscoroutine(result):
-                result = await result
+            with tracer.start_as_current_span("datasette.render") as span:
+                span.set_attribute("datasette.format", format_)
+                span.set_attribute(
+                    "datasette.rows_returned", len(data.get("rows") or [])
+                )
+                result = call_with_supported_arguments(
+                    self.ds.renderers[format_][0],
+                    datasette=self.ds,
+                    columns=data.get("columns") or [],
+                    rows=data.get("rows") or [],
+                    sql=data.get("query", {}).get("sql", None),
+                    query_name=data.get("query_name"),
+                    database=database,
+                    table=data.get("table"),
+                    request=request,
+                    view_name=self.name,
+                    truncated=False,  # TODO: support this
+                    error=data.get("error"),
+                    # These will be deprecated in Datasette 1.0:
+                    args=request.args,
+                    data=data,
+                )
+                if asyncio.iscoroutine(result):
+                    result = await result
             if result is None:
                 raise NotFound("No data")
             if isinstance(result, dict):

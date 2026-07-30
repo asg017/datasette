@@ -527,3 +527,67 @@ open_connections_gauge = meter.create_observable_gauge(
     unit="{connection}",
     description="Open SQLite file connections tracked for closing",
 )
+
+
+# --- Response building ----------------------------------------------------
+#
+# Between "the SQL finished" and "the bytes went out" sits template rendering,
+# facet calculation and CSV serialisation. Without spans for these, a slow
+# page whose queries are all fast shows a trace full of quick db.query spans
+# and a large unexplained gap - which is the single least useful shape a
+# trace can have, because it tells you where the time is *not*.
+
+template_render_duration = meter.create_histogram(
+    "datasette.template.render.duration",
+    unit="s",
+    description="Time spent rendering a Jinja template into a response",
+)
+
+facet_duration = meter.create_histogram(
+    "datasette.facet.duration",
+    unit="s",
+    description="Time spent calculating or suggesting one facet",
+)
+
+facets_timed_out = meter.create_counter(
+    "datasette.facets.timed_out",
+    unit="{facet}",
+    description="Facet calculations abandoned for exceeding facet_time_limit_ms",
+)
+
+csv_rows_streamed = meter.create_counter(
+    "datasette.csv.rows_streamed",
+    unit="{row}",
+    description="Rows written to a streaming CSV response",
+)
+
+
+def record_facets_timed_out(facet_type, count):
+    if count:
+        facets_timed_out.add(count, {"datasette.facet_type": facet_type})
+
+
+def record_csv_rows(rows):
+    if rows:
+        csv_rows_streamed.add(rows)
+
+
+async def traced_facet(span_name, facet_type, phase, awaitable):
+    """
+    Wrap one facet calculation in a span and time it.
+
+    The coroutine is wrapped rather than the dispatch, for the same reason as
+    plugin hookimpls: the facets are built as a list of coroutines and awaited
+    later by `run_sequential`, so timing the construction would measure
+    nothing.
+    """
+    attributes = {"datasette.facet_type": facet_type}
+    started = time.perf_counter()
+    try:
+        with tracer.start_as_current_span(span_name, attributes=attributes):
+            return await awaitable
+    finally:
+        facet_duration.record(
+            time.perf_counter() - started,
+            {**attributes, "datasette.facet_phase": phase},
+        )
