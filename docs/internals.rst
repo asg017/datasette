@@ -2454,7 +2454,7 @@ Spans are ``SpanKind.INTERNAL`` unless a kind is listed below. Only ``db.query``
 
     - ``datasette.plugin`` - Name of the plugin providing the implementation.
     - ``code.function`` - Name of the implementation function.
-    - ``datasette.hook.call_count`` *(optional)* - Number of dispatches represented by an aggregated span.
+    - ``datasette.hook.call_count`` *(optional)* - Number of dispatches represented by an aggregated span. Counts dispatches that were **awaited**, not dispatches attempted: ``render_cell`` stops awaiting once a plugin returns a non-``None`` result, and a plugin whose coroutine is never awaited never runs, so there is nothing to time or count. Such a plugin is absent from the trace rather than present with a low count.
     - ``datasette.hook.total_duration_ms`` *(optional)* - Wall time actually spent inside the hook, summed across every dispatch. This is also the aggregate span's own duration - deliberately, so that a hook dispatched at spread-out points does not appear as one long span covering everything that happened between its first and last call.
     - ``datasette.hook.window_ms`` *(optional)* - First dispatch to last, including everything Datasette did in between. Deliberately not the span's duration - see ``datasette.hook.total_duration_ms``.
     - ``datasette.hook.aggregated`` *(optional)* - True on a span that represents many dispatches rather than one.
