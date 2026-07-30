@@ -412,7 +412,7 @@ class RowView(BaseView):
             raise Forbidden("You do not have permission to view this table")
 
         results = await resolved.db.execute(
-            resolved.sql, resolved.params, truncate=True
+            resolved.sql, resolved.params, truncate=True, table=table
         )
         columns = [r[0] for r in results.description]
         rows = list(results.rows)

@@ -2164,7 +2164,9 @@ async def table_view_data(
 
     # Execute the main query!
     try:
-        results = await db.execute(sql, params, truncate=True, **extra_args)
+        results = await db.execute(
+            sql, params, truncate=True, table=table_name, **extra_args
+        )
     except (sqlite3.OperationalError, InvalidSql) as e:
         raise DatasetteError(str(e), title="Invalid SQL", status=400)
 

@@ -1963,6 +1963,9 @@ Executes a SQL query against the database and returns the resulting rows (see :r
 ``log_sql_errors`` - boolean
     Should any SQL errors be logged to the console in addition to being raised as an error? Defaults to ``True``.
 
+``table`` - string
+    The table this query reads, if the caller already knows it. Used only for telemetry: it is recorded as the ``db.collection.name`` attribute on the query's span, described in :ref:`internals_telemetry`. Datasette never infers this from the SQL, so a query that could be attributed to a table but does not pass this simply carries no such attribute.
+
 .. _database_results:
 
 Results
@@ -2420,6 +2423,8 @@ Spans are ``SpanKind.INTERNAL`` unless a kind is listed below. Only ``db.query``
     - ``db.namespace`` - Name of the database being queried.
     - ``db.query.text`` - The SQL, truncated to 2048 characters. Never the parameter values.
     - ``db.query.parameter.<name>`` *(optional)* - Value of one bound SQL parameter. Only present when the :ref:`setting_trace_sql_parameters` setting is enabled - off by default.
+    - ``db.operation.name`` *(optional)* - The statement's leading keyword - ``SELECT``, ``INSERT``, ``CREATE``, and so on - matched against a small fixed allowlist. Omitted rather than set to an arbitrary value: the allowlist exists because this attribute is a metric dimension candidate, and echoing an unrecognised first token from user-supplied SQL would be an unbounded-cardinality hazard. Also omitted for ``execute_write_script()``, which runs multiple statements - per semantic conventions, the operation name should not be extracted from query text that can contain more than one operation. Note that a statement beginning with a CTE reports ``WITH``, not the operation inside it - a substantial share of Datasette's own reads, including every permission query, take that form. Resolving it further would mean parsing.
+    - ``db.collection.name`` *(optional)* - The primary table, set only where the view already knows it - the table and row pages. Omitted for arbitrary ``?sql=`` queries, where determining the table would mean parsing the query.
     - ``datasette.param_count`` *(optional)* - Number of bound parameters. Recorded instead of the values themselves.
     - ``datasette.time_limit_ms`` *(optional)* - The :ref:`setting_sql_time_limit_ms` value this query ran under.
     - ``datasette.rows_returned`` *(optional)* - Number of rows the operation returned.
@@ -2555,7 +2560,7 @@ The histograms are all in seconds, and each declares its own bucket boundaries -
 .. ]]]
 
 ``db.client.operation.duration``
-    Histogram, unit ``s``. Duration of a SQL operation. The standard OpenTelemetry semantic convention metric, and the one that survives trace sampling.
+    Histogram, unit ``s``. Duration of a SQL operation. The standard OpenTelemetry semantic convention metric, and the one that survives trace sampling. Carries ``db.operation.name`` - semantic conventions list it as conditionally required on this metric when readily available, and the fixed allowlist behind it (see ``db.operation.name`` above) bounds it to a handful of series per existing dimension. Deliberately does **not** carry ``db.collection.name``: unlike the operation name, table names are not drawn from a fixed set, and on a public instance where anyone can create a table, that dimension has no ceiling - every new table would mint a permanent new series alongside the ones already being kept forever.
 
     Bucket boundaries: ``0.0001``, ``0.0005``, ``0.001``, ``0.005``, ``0.01``, ``0.05``, ``0.1``, ``0.5``, ``1``, ``5``, ``10``.
 
@@ -2564,6 +2569,7 @@ The histograms are all in seconds, and each declares its own bucket boundaries -
     - ``db.system``
     - ``db.namespace``
     - ``datasette.operation``
+    - ``db.operation.name`` *(optional)*
     - ``error.type`` *(optional)*
 
 ``datasette.write.queue_wait``

@@ -9,7 +9,13 @@ pytest.importorskip("opentelemetry.sdk")
 from opentelemetry.trace import SpanKind, StatusCode
 
 from datasette.database import Database
-from datasette.telemetry import MAX_SQL_LENGTH, SCHEMA_URL, sql_attribute, tracer
+from datasette.telemetry import (
+    MAX_SQL_LENGTH,
+    SCHEMA_URL,
+    sql_attribute,
+    sql_operation_name,
+    tracer,
+)
 from datasette.version import __version__
 
 SECRET_PARAM_VALUE = "SUPER_SECRET_PARAM_VALUE_XYZ_123"
@@ -465,3 +471,166 @@ async def test_suppressed_sql_error_is_not_an_error_on_the_execute_span(
     span = execute_spans[-1]
     assert span.status.status_code == StatusCode.UNSET
     assert not [event for event in span.events if event.name == "exception"]
+
+
+# --- db.operation.name and db.collection.name -------------------------------
+#
+# Both are `optional=True` in the registry and set only where Datasette
+# already knows the answer with confidence - never guessed from parsing.
+# Omission is the expected, correct outcome for anything the allowlist or the
+# call site does not recognise, so several tests below assert an attribute's
+# *absence*, not just its presence.
+
+
+def test_sql_operation_name_recognises_allowlisted_keywords():
+    "The unit-level function, independent of any span machinery."
+    assert sql_operation_name("select 1") == "SELECT"
+    assert sql_operation_name("  \n  INSERT into t values (1)") == "INSERT"
+    assert sql_operation_name("Create Table t (id integer)") == "CREATE"
+    assert sql_operation_name("with c as (select 1) select * from c") == "WITH"
+
+
+def test_sql_operation_name_omits_rather_than_guesses():
+    """
+    Anything not on the fixed allowlist comes back None, never a value made
+    up from whatever word happens to come first - including a nonsense
+    statement, a statement that leads with punctuation such as a
+    parenthesised SELECT, and a recognisable SQL keyword that is simply not
+    on the (deliberately short) allowlist.
+    """
+    assert sql_operation_name("this is not sql at all") is None
+    assert sql_operation_name("(select 1) union (select 2)") is None
+    assert sql_operation_name("") is None
+    assert sql_operation_name("   ") is None
+    # REINDEX is a real SQLite keyword, just not one of the ones the ticket
+    # put on the allowlist - proves this is a fixed list, not "any keyword".
+    assert sql_operation_name("reindex t") is None
+
+
+@pytest.mark.asyncio
+async def test_db_operation_name_set_for_select(ds_client, otel_spans):
+    response = await ds_client.get("/fixtures/-/query.json?sql=select+1")
+    assert response.status_code == 200
+
+    spans = _db_query_spans(otel_spans)
+    assert spans
+    assert spans[-1].attributes["db.operation.name"] == "SELECT"
+
+
+@pytest.mark.asyncio
+async def test_db_operation_name_omitted_for_unrecognised_statement(
+    ds_client, otel_spans
+):
+    "A nonsense statement must not produce a garbage db.operation.name value."
+    db = ds_client.ds.get_database("fixtures")
+    with pytest.raises(sqlite3.OperationalError):
+        await db.execute("this is not valid sql")
+
+    spans = _db_query_spans(otel_spans)
+    assert spans
+    span = spans[-1]
+    assert span.attributes["db.query.text"] == "this is not valid sql"
+    assert "db.operation.name" not in span.attributes
+
+
+@pytest.mark.asyncio
+async def test_db_operation_name_set_for_write_and_executemany(ds_client, otel_spans):
+    db = Database(ds_client.ds, is_memory=True)
+    ds_client.ds.add_database(db, name="db_operation_name_write")
+    try:
+        await db.execute_write("create table t (id integer primary key, v text)")
+        otel_spans.clear()
+
+        await db.execute_write("insert into t (id, v) values (1, 'a')")
+        await db.execute_write_many(
+            "insert into t (id, v) values (?, ?)", [(2, "b"), (3, "c")]
+        )
+
+        spans = _db_query_spans(otel_spans)
+        assert len(spans) == 2
+        assert spans[0].attributes["db.operation.name"] == "INSERT"
+        assert spans[1].attributes["db.operation.name"] == "INSERT"
+        assert spans[1].attributes["datasette.executemany"] is True
+    finally:
+        ds_client.ds.remove_database("db_operation_name_write")
+
+
+@pytest.mark.asyncio
+async def test_db_operation_name_omitted_for_execute_write_script(
+    ds_client, otel_spans
+):
+    """
+    execute_write_script() runs multiple semicolon-separated statements, so
+    per semantic conventions' guidance for db.operation.name - it should not
+    be extracted from query text that can contain more than one operation -
+    the attribute is left off entirely rather than reporting only the first
+    statement's keyword.
+    """
+    db = Database(ds_client.ds, is_memory=True)
+    ds_client.ds.add_database(db, name="db_operation_name_script")
+    try:
+        otel_spans.clear()
+
+        await db.execute_write_script(
+            "create table t (id integer); create table t2 (id integer);"
+        )
+
+        spans = _db_query_spans(otel_spans)
+        assert spans
+        span = spans[-1]
+        assert span.attributes["datasette.executescript"] is True
+        assert "db.operation.name" not in span.attributes
+    finally:
+        ds_client.ds.remove_database("db_operation_name_script")
+
+
+@pytest.mark.asyncio
+async def test_db_collection_name_set_on_table_page(ds_client, otel_spans):
+    response = await ds_client.get("/fixtures/simple_primary_key.json")
+    assert response.status_code == 200
+
+    spans_with_table = [
+        span
+        for span in _db_query_spans(otel_spans)
+        if "db.collection.name" in span.attributes
+    ]
+    assert (
+        spans_with_table
+    ), "expected the main table-page query to carry db.collection.name"
+    for span in spans_with_table:
+        assert span.attributes["db.collection.name"] == "simple_primary_key"
+
+
+@pytest.mark.asyncio
+async def test_db_collection_name_set_on_row_page(ds_client, otel_spans):
+    response = await ds_client.get("/fixtures/simple_primary_key/1.json")
+    assert response.status_code == 200
+
+    spans_with_table = [
+        span
+        for span in _db_query_spans(otel_spans)
+        if "db.collection.name" in span.attributes
+    ]
+    assert spans_with_table, "expected the row-page query to carry db.collection.name"
+    for span in spans_with_table:
+        assert span.attributes["db.collection.name"] == "simple_primary_key"
+
+
+@pytest.mark.asyncio
+async def test_db_collection_name_omitted_for_arbitrary_sql(ds_client, otel_spans):
+    """
+    An arbitrary ?sql= query is not run through the table or row view, so
+    nothing there knows the table - even though the table name is sitting
+    right there in the SQL text. Determining it would mean parsing, which is
+    exactly what this attribute must not do; the analyser that could do it
+    accurately (`analyze_sql_tables()`) is too expensive to run per query and
+    is deliberately not called from the telemetry path.
+    """
+    response = await ds_client.get(
+        "/fixtures/-/query.json?sql=select+*+from+simple_primary_key"
+    )
+    assert response.status_code == 200
+
+    spans = _db_query_spans(otel_spans)
+    assert spans
+    assert "db.collection.name" not in spans[-1].attributes

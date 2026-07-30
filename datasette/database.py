@@ -24,10 +24,13 @@ from .telemetry import (
     record_write_queue_wait,
     should_record_parameters,
     sql_attribute,
+    sql_operation_name,
     tracer,
 )
 from .telemetry_registry import (
+    DB_COLLECTION_NAME,
     DB_NAMESPACE,
+    DB_OPERATION_NAME,
     DB_QUERY,
     DB_QUERY_EXECUTE,
     DB_QUERY_TEXT,
@@ -304,14 +307,19 @@ class Database:
                 cursor, return_all=return_all, returning_limit=returning_limit
             )
 
+        operation_name = sql_operation_name(sql)
         with tracer.start_as_current_span(DB_QUERY, kind=DB_QUERY.kind) as span:
             span.set_attribute(DB_SYSTEM, "sqlite")
             span.set_attribute(DB_NAMESPACE, self.name)
             span.set_attribute(DB_QUERY_TEXT, sql_attribute(sql))
+            if operation_name is not None:
+                span.set_attribute(DB_OPERATION_NAME, operation_name)
             if params:
                 span.set_attribute(PARAM_COUNT, len(params))
                 self._record_parameters(span, params)
-            with record_operation_duration(self.name, "write"):
+            with record_operation_duration(
+                self.name, "write", operation_name=operation_name
+            ):
                 results = await self.execute_write_fn(
                     _inner, block=block, request=request, transaction=transaction
                 )
@@ -323,6 +331,11 @@ class Database:
         def _inner(conn):
             return conn.executescript(sql)
 
+        # No db.operation.name here, deliberately: executescript() runs
+        # multiple semicolon-separated statements, and semantic conventions
+        # say the attribute should not be extracted from query text that can
+        # hold more than one operation (see sql_operation_name()'s docstring)
+        # rather than reporting only the first statement's keyword.
         with tracer.start_as_current_span(DB_QUERY, kind=DB_QUERY.kind) as span:
             span.set_attribute(DB_SYSTEM, "sqlite")
             span.set_attribute(DB_NAMESPACE, self.name)
@@ -348,12 +361,19 @@ class Database:
 
             return conn.executemany(sql, count_params(params_seq)), count
 
+        # A single SQL statement executed with many parameter sets, so unlike
+        # execute_write_script() there is exactly one operation to name.
+        operation_name = sql_operation_name(sql)
         with tracer.start_as_current_span(DB_QUERY, kind=DB_QUERY.kind) as span:
             span.set_attribute(DB_SYSTEM, "sqlite")
             span.set_attribute(DB_NAMESPACE, self.name)
             span.set_attribute(DB_QUERY_TEXT, sql_attribute(sql))
             span.set_attribute(EXECUTEMANY, True)
-            with record_operation_duration(self.name, "write"):
+            if operation_name is not None:
+                span.set_attribute(DB_OPERATION_NAME, operation_name)
+            with record_operation_duration(
+                self.name, "write", operation_name=operation_name
+            ):
                 results, count = await self.execute_write_fn(
                     _inner, block=block, request=request
                 )
@@ -652,8 +672,16 @@ class Database:
         custom_time_limit=None,
         page_size=None,
         log_sql_errors=True,
+        table=None,
     ):
-        """Executes sql against db_name in a thread"""
+        """Executes sql against db_name in a thread
+
+        `table`, if passed, is recorded as the db.collection.name span
+        attribute. It exists for callers that already know the table this
+        query targets - the table and row views - and is never derived from
+        `sql` itself: see the note on DB_COLLECTION_NAME in
+        telemetry_registry.py for why that path is not taken from here.
+        """
         self._check_not_closed()
         page_size = page_size or self.ds.page_size
         time_limit_ms = self.ds.sql_time_limit_ms
@@ -710,6 +738,7 @@ class Database:
         # Exception handling is explicit rather than left to the context
         # manager's defaults, so that callers passing log_sql_errors=False can
         # be honoured - see the comment on the generic handler below.
+        operation_name = sql_operation_name(sql)
         with tracer.start_as_current_span(
             DB_QUERY,
             kind=DB_QUERY.kind,
@@ -720,11 +749,17 @@ class Database:
             span.set_attribute(DB_NAMESPACE, self.name)
             span.set_attribute(DB_QUERY_TEXT, sql_attribute(sql))
             span.set_attribute(TIME_LIMIT_MS, time_limit_ms)
+            if operation_name is not None:
+                span.set_attribute(DB_OPERATION_NAME, operation_name)
+            if table is not None:
+                span.set_attribute(DB_COLLECTION_NAME, table)
             if params:
                 span.set_attribute(PARAM_COUNT, len(params))
                 self._record_parameters(span, params)
             try:
-                with record_operation_duration(self.name, "read"):
+                with record_operation_duration(
+                    self.name, "read", operation_name=operation_name
+                ):
                     results = await self.execute_fn(sql_operation_in_thread)
             except QueryInterrupted as e:
                 span.set_status(Status(StatusCode.ERROR, str(e)))
