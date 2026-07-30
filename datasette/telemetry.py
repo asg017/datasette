@@ -31,6 +31,70 @@ def sql_attribute(sql: str) -> str:
     return sql[:MAX_SQL_LENGTH] + "…[truncated]"
 
 
+# --- SQL parameter values -------------------------------------------------
+#
+# Recording parameter values is OFF by default and stays that way unless an
+# operator opts in with the trace_sql_parameters setting. Two things make this
+# genuinely dangerous rather than merely verbose:
+#
+# 1. Permission SQL binds the actor. utils/permissions.py binds
+#    json.dumps(actor) as :actor and the actor id as :actor_id on every
+#    permission check, so recording parameters on the internal database
+#    exports actor identity - which is exactly what the permission spans go
+#    out of their way not to do. The "user" mode exists to structurally
+#    prevent that, rather than relying on a denylist of parameter names.
+#
+# 2. Canned queries can bind cookies and headers. The _cookie_* and _header_*
+#    magic parameters resolve to request cookies and headers, so a canned
+#    query can bind a session cookie or an Authorization header as an
+#    ordinary SQL parameter. No mode protects against that, because those
+#    queries run against user databases - it is documented instead.
+
+TRACE_SQL_PARAMETER_MODES = ("off", "user", "all")
+
+# Per-value cap. Parameters are usually short, but a single IN (...) clause or
+# a pasted blob should not be able to dominate a span.
+MAX_PARAM_LENGTH = 256
+
+# Cap on how many parameters are recorded for one query.
+MAX_PARAMS = 32
+
+
+def should_record_parameters(mode: str, is_internal_database: bool) -> bool:
+    "Whether parameter values may be recorded, given the setting and the database."
+    if mode == "all":
+        return True
+    if mode == "user":
+        return not is_internal_database
+    return False
+
+
+def _parameter_value(value) -> str:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        # Never the content: a blob is both useless as a span attribute and
+        # the most likely thing to contain something private.
+        return f"<bytes[{len(value)}]>"
+    text = str(value)
+    if len(text) <= MAX_PARAM_LENGTH:
+        return text
+    return text[:MAX_PARAM_LENGTH] + "…[truncated]"
+
+
+def parameter_attributes(params):
+    """
+    Yield (attribute_name, value) pairs for a query's parameters.
+
+    Named parameters keep their names; positional parameters are numbered.
+    Both are namespaced under OTel's db.query.parameter.<key> convention.
+    """
+    if isinstance(params, dict):
+        items = list(params.items())
+    else:
+        items = list(enumerate(params or []))
+    for key, value in items[:MAX_PARAMS]:
+        yield f"db.query.parameter.{key}", _parameter_value(value)
+
+
 # Hooks that Datasette dispatches from inside per-row/per-cell loops. A single
 # 100 row x 15 column table page dispatches render_cell ~1,500 times; one span
 # per dispatch would blow straight through BatchSpanProcessor's default

@@ -707,6 +707,7 @@ async def test_settings_json(ds_client):
         "force_https_urls": False,
         "template_debug": False,
         "base_url": "/",
+        "trace_sql_parameters": "off",
     }
 
 

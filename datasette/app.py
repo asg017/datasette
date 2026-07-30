@@ -49,7 +49,7 @@ from .events import Event
 from .plugins import DEFAULT_PLUGINS, get_plugins, pm
 from .renderer import json_renderer
 from .resources import DatabaseResource, TableResource
-from .telemetry import aggregate_hook_spans, tracer
+from .telemetry import TRACE_SQL_PARAMETER_MODES, aggregate_hook_spans, tracer
 from .tokens import TokenInvalid
 from .url_builder import Urls
 from .utils import (
@@ -288,6 +288,11 @@ SETTINGS = (
         "Allow display of template debug information with ?_context=1",
     ),
     Setting("base_url", "/", "Datasette URLs should use this base path"),
+    Setting(
+        "trace_sql_parameters",
+        "off",
+        'Record SQL parameter values on OpenTelemetry spans: "off", "user" (skip the internal database) or "all"',
+    ),
 )
 _HASH_URLS_REMOVED = "The hash_urls setting has been removed, try the datasette-hashed-urls plugin instead"
 OBSOLETE_SETTINGS = {
@@ -566,6 +571,28 @@ class Datasette:
         self.config = config
         # CLI settings should overwrite datasette.json settings
         self._settings = dict(DEFAULT_SETTINGS, **(config_settings), **(settings or {}))
+
+        # trace_sql_parameters is an enum, which the type check above cannot
+        # catch - every mode is a string. Getting it wrong should fail loudly
+        # at startup rather than silently recording nothing, because "I set it
+        # and no parameters appeared" is indistinguishable from a typo.
+        trace_sql_parameters = self._settings.get("trace_sql_parameters")
+        if trace_sql_parameters not in TRACE_SQL_PARAMETER_MODES:
+            raise StartupError(
+                "Setting 'trace_sql_parameters' must be one of "
+                + ", ".join(repr(mode) for mode in TRACE_SQL_PARAMETER_MODES)
+                + f", got {trace_sql_parameters!r}"
+            )
+        if trace_sql_parameters != "off":
+            # Loud on purpose. This exports user-supplied query parameters to
+            # whatever tracing backend is configured, and under "all" it also
+            # exports actor identity via permission SQL's :actor parameter.
+            sys.stderr.write(
+                f"Datasette: trace_sql_parameters={trace_sql_parameters!r} - SQL parameter "
+                "values will be recorded on OpenTelemetry spans and sent to your tracing "
+                "backend.\n"
+            )
+            sys.stderr.flush()
         self.renderers = {}  # File extension -> (renderer, can_render) functions
         self.version_note = version_note
         if self.setting("num_sql_threads") == 0:

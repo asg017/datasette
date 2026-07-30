@@ -2460,9 +2460,13 @@ The spans below were captured by running instrumented requests and recording eve
 Privacy
 -------
 
-``db.query.text`` is recorded on every ``db.query`` span, truncated to 2048 characters. **SQL parameter values are never recorded** - only ``datasette.param_count``. **Actor identifiers are never recorded** - only ``datasette.actor_present``.
+``db.query.text`` is recorded on every ``db.query`` span, truncated to 2048 characters. **By default SQL parameter values are never recorded** - only ``datasette.param_count``. **Actor identifiers are never recorded** - only ``datasette.actor_present``.
 
 If you export spans to a third-party tracing vendor, keep in mind that on a public Datasette instance the SQL text is user-supplied: anything visitors type into the query editor or pass as ``?sql=`` will leave your infrastructure as part of ``db.query.text``.
+
+Parameter values can be recorded by opting in with the :ref:`setting_trace_sql_parameters` setting, which defaults to ``off``. Read that setting's warning before enabling it: permission checks bind the actor as a parameter, and canned queries using the ``_cookie_*`` or ``_header_*`` magic parameters can bind session cookies and ``Authorization`` headers. When enabled, values appear as ``db.query.parameter.<name>`` attributes, truncated to 256 characters, capped at 32 parameters per query, with blobs recorded as ``<bytes[N]>`` rather than by content.
+
+Parameter values are never recorded for ``execute_write_many()``, whose parameter sequence can hold thousands of rows.
 
 For plugin authors
 ------------------
