@@ -22,6 +22,34 @@ from opentelemetry import metrics as otel_metrics
 from opentelemetry import trace as otel_trace
 from opentelemetry.trace import Status, StatusCode
 
+from .telemetry_registry import (
+    CODE_FUNCTION,
+    DB_NAMESPACE,
+    DB_QUERY_PARAMETER,
+    DB_SYSTEM,
+    ERROR_TYPE,
+    FACET_PHASE,
+    FACET_TYPE,
+    HOOK,
+    HOOK_AGGREGATED,
+    HOOK_CALL_COUNT,
+    HOOK_TOTAL_DURATION_MS,
+    M_CONNECTIONS_OPEN,
+    M_CSV_ROWS_STREAMED,
+    M_FACET_DURATION,
+    M_FACETS_TIMED_OUT,
+    M_OPERATION_DURATION,
+    M_QUERIES_INTERRUPTED,
+    M_QUERIES_PENDING,
+    M_TEMPLATE_RENDER_DURATION,
+    M_THREADS_LIMIT,
+    M_THREADS_QUEUE_DEPTH,
+    M_WRITE_QUEUE_DEPTH,
+    M_WRITE_QUEUE_WAIT,
+    OPERATION,
+    PLUGIN,
+)
+
 tracer = otel_trace.get_tracer("datasette")
 meter = otel_metrics.get_meter("datasette")
 
@@ -97,7 +125,7 @@ def parameter_attributes(params):
     else:
         items = list(enumerate(params or []))
     for key, value in items[:MAX_PARAMS]:
-        yield f"db.query.parameter.{key}", _parameter_value(value)
+        yield DB_QUERY_PARAMETER.replace("<name>", str(key)), _parameter_value(value)
 
 
 # Hooks that Datasette dispatches from inside per-row/per-cell loops. A single
@@ -132,17 +160,17 @@ def aggregate_hook_spans():
 def _flush_hook_aggregate(bucket):
     for (hook_name, plugin_name, function_name), stats in bucket.items():
         span = tracer.start_span(
-            "datasette.hook." + hook_name,
+            HOOK + hook_name,
             start_time=stats["first_start"],
             attributes={
-                "datasette.plugin": plugin_name,
-                "code.function": function_name,
-                "datasette.hook.call_count": stats["count"],
+                PLUGIN: plugin_name,
+                CODE_FUNCTION: function_name,
+                HOOK_CALL_COUNT: stats["count"],
                 # Wall time actually spent inside the hook, summed across every
                 # dispatch. The span's own duration spans first dispatch to last
                 # and so also covers the work in between them.
-                "datasette.hook.total_duration_ms": stats["total_ns"] / 1e6,
-                "datasette.hook.aggregated": True,
+                HOOK_TOTAL_DURATION_MS: stats["total_ns"] / 1e6,
+                HOOK_AGGREGATED: True,
             },
         )
         span.end(end_time=stats["last_end"])
@@ -205,10 +233,10 @@ def instrument_hookimpl(hook_name, plugin_name, function):
     every plugin doing I/O, exactly the ones worth measuring, would report 0ms.
     """
     function_name = getattr(function, "__name__", repr(function))
-    span_name = "datasette.hook." + hook_name
+    span_name = HOOK + hook_name
     attributes = {
-        "datasette.plugin": plugin_name,
-        "code.function": function_name,
+        PLUGIN: plugin_name,
+        CODE_FUNCTION: function_name,
     }
     aggregate_key = (
         (hook_name, plugin_name, function_name)
@@ -312,29 +340,29 @@ def instrument_plugin_hookimpls(pm, plugin, plugin_name):
 
 def _duration_attributes(database_name, operation):
     return {
-        "db.system": "sqlite",
-        "db.namespace": database_name,
-        "datasette.operation": operation,
+        DB_SYSTEM: "sqlite",
+        DB_NAMESPACE: database_name,
+        OPERATION: operation,
     }
 
 
 sql_operation_duration = meter.create_histogram(
-    "db.client.operation.duration",
-    unit="s",
+    M_OPERATION_DURATION,
+    unit=M_OPERATION_DURATION.unit,
     description="Duration of a SQL operation issued by Datasette",
 )
 
 write_queue_wait = meter.create_histogram(
-    "datasette.write.queue_wait",
-    unit="s",
+    M_WRITE_QUEUE_WAIT,
+    unit=M_WRITE_QUEUE_WAIT.unit,
     description=(
         "Time a write spent queued behind the single write thread for its database"
     ),
 )
 
 queries_interrupted = meter.create_counter(
-    "datasette.sql.queries.interrupted",
-    unit="{query}",
+    M_QUERIES_INTERRUPTED,
+    unit=M_QUERIES_INTERRUPTED.unit,
     description=(
         "Queries cancelled for exceeding sql_time_limit_ms. Not derivable from "
         "spans under sampling, and the signal that a time limit is too tight"
@@ -357,18 +385,18 @@ def record_operation_duration(database_name, operation):
     try:
         yield
     except BaseException as exception:
-        attributes["error.type"] = type(exception).__qualname__
+        attributes[ERROR_TYPE] = type(exception).__qualname__
         raise
     finally:
         sql_operation_duration.record(time.perf_counter() - started, attributes)
 
 
 def record_write_queue_wait(database_name, waited_ns):
-    write_queue_wait.record(waited_ns / 1e9, {"db.namespace": database_name})
+    write_queue_wait.record(waited_ns / 1e9, {DB_NAMESPACE: database_name})
 
 
 def record_query_interrupted(database_name):
-    queries_interrupted.add(1, {"db.namespace": database_name})
+    queries_interrupted.add(1, {DB_NAMESPACE: database_name})
 
 
 # Live Datasette instances, weakly held so that instrumenting an instance
@@ -462,7 +490,7 @@ def observe_pending_queries(options=None):
     for ds in _live_instances():
         for db in _databases_of(ds):
             yield otel_metrics.Observation(
-                len(db._pending_execute_futures), {"db.namespace": db.name}
+                len(db._pending_execute_futures), {DB_NAMESPACE: db.name}
             )
 
 
@@ -479,9 +507,7 @@ def observe_write_queue_depth(options=None):
             if write_queue is None:
                 # No write has ever been queued for this database.
                 continue
-            yield otel_metrics.Observation(
-                write_queue.qsize(), {"db.namespace": db.name}
-            )
+            yield otel_metrics.Observation(write_queue.qsize(), {DB_NAMESPACE: db.name})
 
 
 def observe_open_connections(options=None):
@@ -489,42 +515,42 @@ def observe_open_connections(options=None):
     for ds in _live_instances():
         for db in _databases_of(ds):
             yield otel_metrics.Observation(
-                len(db._all_file_connections), {"db.namespace": db.name}
+                len(db._all_file_connections), {DB_NAMESPACE: db.name}
             )
 
 
 sql_thread_limit_gauge = meter.create_observable_gauge(
-    "datasette.sql.threads.limit",
+    M_THREADS_LIMIT,
     callbacks=[observe_sql_thread_limit],
-    unit="{thread}",
+    unit=M_THREADS_LIMIT.unit,
     description="Maximum concurrent read queries (the num_sql_threads setting)",
 )
 
 sql_thread_queue_depth_gauge = meter.create_observable_gauge(
-    "datasette.sql.threads.queue_depth",
+    M_THREADS_QUEUE_DEPTH,
     callbacks=[observe_sql_thread_queue_depth],
-    unit="{query}",
+    unit=M_THREADS_QUEUE_DEPTH.unit,
     description="Read queries waiting for a free thread in the shared SQL pool",
 )
 
 pending_queries_gauge = meter.create_observable_gauge(
-    "datasette.sql.queries.pending",
+    M_QUERIES_PENDING,
     callbacks=[observe_pending_queries],
-    unit="{query}",
+    unit=M_QUERIES_PENDING.unit,
     description="Read queries submitted to the pool and not yet complete",
 )
 
 write_queue_depth_gauge = meter.create_observable_gauge(
-    "datasette.write.queue_depth",
+    M_WRITE_QUEUE_DEPTH,
     callbacks=[observe_write_queue_depth],
-    unit="{write}",
+    unit=M_WRITE_QUEUE_DEPTH.unit,
     description="Writes queued behind a database's single write thread",
 )
 
 open_connections_gauge = meter.create_observable_gauge(
-    "datasette.connections.open",
+    M_CONNECTIONS_OPEN,
     callbacks=[observe_open_connections],
-    unit="{connection}",
+    unit=M_CONNECTIONS_OPEN.unit,
     description="Open SQLite file connections tracked for closing",
 )
 
@@ -538,33 +564,33 @@ open_connections_gauge = meter.create_observable_gauge(
 # trace can have, because it tells you where the time is *not*.
 
 template_render_duration = meter.create_histogram(
-    "datasette.template.render.duration",
-    unit="s",
+    M_TEMPLATE_RENDER_DURATION,
+    unit=M_TEMPLATE_RENDER_DURATION.unit,
     description="Time spent rendering a Jinja template into a response",
 )
 
 facet_duration = meter.create_histogram(
-    "datasette.facet.duration",
-    unit="s",
+    M_FACET_DURATION,
+    unit=M_FACET_DURATION.unit,
     description="Time spent calculating or suggesting one facet",
 )
 
 facets_timed_out = meter.create_counter(
-    "datasette.facets.timed_out",
-    unit="{facet}",
+    M_FACETS_TIMED_OUT,
+    unit=M_FACETS_TIMED_OUT.unit,
     description="Facet calculations abandoned for exceeding facet_time_limit_ms",
 )
 
 csv_rows_streamed = meter.create_counter(
-    "datasette.csv.rows_streamed",
-    unit="{row}",
+    M_CSV_ROWS_STREAMED,
+    unit=M_CSV_ROWS_STREAMED.unit,
     description="Rows written to a streaming CSV response",
 )
 
 
 def record_facets_timed_out(facet_type, count):
     if count:
-        facets_timed_out.add(count, {"datasette.facet_type": facet_type})
+        facets_timed_out.add(count, {FACET_TYPE: facet_type})
 
 
 def record_csv_rows(rows):
@@ -581,7 +607,7 @@ async def traced_facet(span_name, facet_type, phase, awaitable):
     later by `run_sequential`, so timing the construction would measure
     nothing.
     """
-    attributes = {"datasette.facet_type": facet_type}
+    attributes = {FACET_TYPE: facet_type}
     started = time.perf_counter()
     try:
         with tracer.start_as_current_span(span_name, attributes=attributes):
@@ -589,5 +615,5 @@ async def traced_facet(span_name, facet_type, phase, awaitable):
     finally:
         facet_duration.record(
             time.perf_counter() - started,
-            {**attributes, "datasette.facet_phase": phase},
+            {**attributes, FACET_PHASE: phase},
         )

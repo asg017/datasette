@@ -8,6 +8,7 @@ from datasette.extras import Extra, ExtraExample, ExtraRegistry, ExtraScope, Pro
 from datasette.plugins import pm
 from datasette.resources import DatabaseResource, TableResource
 from datasette.telemetry import record_facets_timed_out, traced_facet
+from datasette.telemetry_registry import FACET_RESULTS, FACET_SUGGEST
 from datasette.utils import (
     await_me_maybe,
     call_with_supported_arguments,
@@ -227,7 +228,7 @@ class FacetResultsExtra(Extra):
         if not context.nofacet:
             facet_awaitables = [
                 traced_facet(
-                    "datasette.facet_results",
+                    FACET_RESULTS,
                     facet.type,
                     "results",
                     facet.facet_results(),
@@ -304,9 +305,7 @@ class SuggestedFacetsExtra(Extra):
             and not context.nosuggest
         ):
             facet_suggest_awaitables = [
-                traced_facet(
-                    "datasette.facet_suggest", facet.type, "suggest", facet.suggest()
-                )
+                traced_facet(FACET_SUGGEST, facet.type, "suggest", facet.suggest())
                 for facet in facet_instances
             ]
             for suggest_result in await context.run_sequential(

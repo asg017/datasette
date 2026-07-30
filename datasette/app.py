@@ -57,6 +57,21 @@ from .telemetry import (
     tracer,
     unregister_datasette,
 )
+from .telemetry_registry import (
+    ACTION,
+    ACTIONS,
+    ACTOR_PRESENT,
+    ALLOWED_RESOURCES,
+    PERMISSION_CACHED,
+    PERMISSION_CHECK,
+    PERMISSION_RESOURCES_SQL,
+    PERMISSION_RESULT,
+    RENDER_TEMPLATE,
+    RESOURCE,
+    RESOURCES_RETURNED,
+    TEMPLATE,
+    VIEW_NAME,
+)
 from .tokens import TokenInvalid
 from .url_builder import Urls
 from .utils import (
@@ -1764,14 +1779,14 @@ class Datasette:
         # rather than patched on afterwards. Never include an actor
         # identifier here - only whether one was present.
         span_attributes = {
-            "datasette.action": action,
-            "datasette.actor_present": actor is not None,
+            ACTION: action,
+            ACTOR_PRESENT: actor is not None,
         }
         if parent is not None:
-            span_attributes["datasette.resource"] = parent
+            span_attributes[RESOURCE] = parent
 
         with tracer.start_as_current_span(
-            "datasette.permission_resources_sql", attributes=span_attributes
+            PERMISSION_RESOURCES_SQL, attributes=span_attributes
         ):
             action_obj = self.actions.get(action)
             if not action_obj:
@@ -1846,14 +1861,14 @@ class Datasette:
         # rather than patched on afterwards. Never include an actor
         # identifier here - only whether one was present.
         span_attributes = {
-            "datasette.action": action,
-            "datasette.actor_present": actor is not None,
+            ACTION: action,
+            ACTOR_PRESENT: actor is not None,
         }
         if parent is not None:
-            span_attributes["datasette.resource"] = parent
+            span_attributes[RESOURCE] = parent
 
         with tracer.start_as_current_span(
-            "datasette.allowed_resources", attributes=span_attributes
+            ALLOWED_RESOURCES, attributes=span_attributes
         ) as span:
             action_obj = self.actions.get(action)
             if not action_obj:
@@ -1935,7 +1950,7 @@ class Datasette:
                 # Use tilde-encoding like table pagination
                 next_token = f"{tilde_encode(str(last_resource.parent))},{tilde_encode(str(last_resource.child))}"
 
-            span.set_attribute("datasette.resources_returned", len(resources))
+            span.set_attribute(RESOURCES_RETURNED, len(resources))
 
             return PaginatedResources(
                 resources=resources,
@@ -2020,18 +2035,16 @@ class Datasette:
         # Attributes knowable up front, so they can be set at span start
         # rather than patched on afterwards. Never include an actor
         # identifier here - only whether one was present.
-        span_attributes = {"datasette.actor_present": actor is not None}
+        span_attributes = {ACTOR_PRESENT: actor is not None}
         if len(requested) == 1:
-            span_attributes["datasette.action"] = requested[0]
+            span_attributes[ACTION] = requested[0]
         else:
-            span_attributes["datasette.actions"] = tuple(requested)
+            span_attributes[ACTIONS] = tuple(requested)
         if resource is not None:
-            span_attributes["datasette.resource"] = (
-                parent if child is None else f"{parent}/{child}"
-            )
+            span_attributes[RESOURCE] = parent if child is None else f"{parent}/{child}"
 
         with tracer.start_as_current_span(
-            "datasette.permission_check", attributes=span_attributes
+            PERMISSION_CHECK, attributes=span_attributes
         ) as span:
             # Expand also_requires dependencies (transitively) so that each
             # dependency is resolved within the same batch
@@ -2114,9 +2127,9 @@ class Datasette:
             # Not known until here: whether every check was served from the
             # cache (the N+1 signal) and, for single-action calls, the
             # verdict itself.
-            span.set_attribute("datasette.permission.cached", not to_check)
+            span.set_attribute(PERMISSION_CACHED, not to_check)
             if len(requested) == 1:
-                span.set_attribute("datasette.result", final[requested[0]])
+                span.set_attribute(PERMISSION_RESULT, final[requested[0]])
 
             return {name: final[name] for name in requested}
 
@@ -2436,9 +2449,9 @@ class Datasette:
         # selection and context building as well as the render itself - those
         # await plugin hooks and asset URL resolution, and a span that started
         # at render_async() would leave that time in an unexplained gap.
-        with tracer.start_as_current_span("datasette.render_template") as span:
+        with tracer.start_as_current_span(RENDER_TEMPLATE) as span:
             if view_name:
-                span.set_attribute("datasette.view_name", view_name)
+                span.set_attribute(VIEW_NAME, view_name)
             # Which template gets selected is only known partway through the
             # body, so it is carried back out here rather than stored on self,
             # which concurrent requests would race on.
@@ -2451,7 +2464,7 @@ class Datasette:
             finally:
                 template_render_duration.record(
                     time.perf_counter() - started,
-                    {"datasette.template": selected.get("template", "unknown")},
+                    {TEMPLATE: selected.get("template", "unknown")},
                 )
 
     async def _render_template(
@@ -2477,7 +2490,7 @@ class Datasette:
         # A Template built with from_string() has no name.
         template_name = template.name or "<string>"
         selected["template"] = template_name
-        span.set_attribute("datasette.template", template_name)
+        span.set_attribute(TEMPLATE, template_name)
         if dataclasses.is_dataclass(context):
             # Shallow conversion - asdict() would deep-copy values, which
             # is wasteful and fails on values like sqlite3.Row

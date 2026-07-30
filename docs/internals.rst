@@ -2396,128 +2396,135 @@ The default ``BatchSpanProcessor`` buffers spans before writing them out, so out
 Span reference
 --------------
 
-The spans below were captured by running instrumented requests and recording every span name together with its attribute keys. Attribute names use the ``datasette.*`` prefix for Datasette-specific data, alongside standard OpenTelemetry attributes such as ``db.system``.
+Attribute names use the ``datasette.*`` prefix for Datasette-specific data, alongside standard OpenTelemetry attributes such as ``db.system``.
+
+This reference is generated from ``datasette/telemetry_registry.py``, the single source of truth for every span, attribute and metric Datasette emits. A conformance test makes real requests and compares what is actually emitted against that registry in both directions, so nothing here is hand-maintained and nothing can silently drift out of date.
+
+.. [[[cog
+    from telemetry_doc import spans
+    spans(cog)
+.. ]]]
 
 ``db.query``
-    One span per logical query.
+    A SQL operation issued by Datasette, covering the full round trip including any time spent queued for a thread.
 
     Attributes:
 
-    - ``db.system`` - always ``sqlite``
-    - ``db.namespace`` - the database name
-    - ``db.query.text`` - the SQL text, truncated to 2048 characters
-    - ``datasette.rows_returned``
-    - ``datasette.truncated``
-    - ``datasette.time_limit_ms``
-    - ``datasette.param_count`` - a **count** of bound parameters, never their values
-    - ``datasette.executemany`` - present only on ``execute_write_many``
-    - ``datasette.executescript`` - present only on ``execute_write_script``
-    - ``datasette.interrupted`` - present only when a query hits the time limit; the span status is also set to ``ERROR`` when this happens
+    - ``db.system`` - Always ``sqlite``.
+    - ``db.namespace`` - Name of the database being queried.
+    - ``db.query.text`` - The SQL, truncated to 2048 characters. Never the parameter values.
+    - ``db.query.parameter.<name>`` *(optional)* - Value of one bound SQL parameter. Only present when the :ref:`setting_trace_sql_parameters` setting is enabled - off by default.
+    - ``datasette.param_count`` *(optional)* - Number of bound parameters. Recorded instead of the values themselves.
+    - ``datasette.time_limit_ms`` *(optional)* - The :ref:`setting_sql_time_limit_ms` value this query ran under.
+    - ``datasette.rows_returned`` *(optional)* - Number of rows the operation returned.
+    - ``datasette.truncated`` *(optional)* - True if the result was cut short by :ref:`setting_max_returned_rows`.
+    - ``datasette.interrupted`` *(optional)* - True if the query was cancelled for exceeding the time limit. The span status is also set to ``ERROR``.
+    - ``datasette.sql_error_suppressed`` *(optional)* - True when the query failed but the caller passed ``log_sql_errors=False``, meaning it was probing and treats failure as an expected answer. Facet suggestion does this against every column.
+    - ``datasette.executescript`` *(optional)* - True for ``execute_write_script()``, which runs multiple statements.
+    - ``datasette.executemany`` *(optional)* - True for ``execute_write_many()``. Parameter values are never recorded for this call, whose parameter sequence can hold thousands of rows.
 
 ``db.query.execute``
-    The read executed inside a SQL worker thread. Child of ``db.query``. No attributes.
+    The read executing inside a SQL worker thread. Child of ``db.query``; the gap between the two is time spent waiting for a thread.
+
+    No attributes.
 
 ``db.write.queue_wait``
-    Time a write spent waiting in the per-database write queue before the write thread picked it up. Child of ``db.query``. No attributes.
+    Time a write spent waiting in its database's write queue before the write thread picked it up. Child of ``db.query``.
+
+    No attributes.
 
 ``db.write.execute``
     The write executing on the write thread. Child of ``db.query``.
 
     Attributes:
 
-    - ``datasette.isolated_connection``
-    - ``datasette.transaction``
+    - ``datasette.isolated_connection`` - True if the write ran on its own connection rather than the shared write connection.
+    - ``datasette.transaction`` - False for statements such as ``VACUUM`` that cannot run inside a transaction.
 
-``datasette.hook.<hook_name>``
-    One span per plugin hook implementation dispatched, for example ``datasette.hook.permission_resources_sql``.
+``datasette.hook.*``
+    One plugin hook implementation running, named for the hook - for example ``datasette.hook.extra_body_script``. For an ``async def`` implementation the span covers the ``await``, not pluggy's synchronous dispatch. Hooks dispatched per row or per cell are aggregated into one span per request rather than one span per dispatch.
 
     Attributes:
 
-    - ``datasette.plugin`` - the plugin name
-    - ``code.function`` - the implementation function name
-
-    Per-cell hooks (``render_cell``) are aggregated into one span per request instead of one span per cell. That aggregated span additionally carries:
-
-    - ``datasette.hook.aggregated`` - ``true``
-    - ``datasette.hook.call_count``
-    - ``datasette.hook.total_duration_ms``
+    - ``datasette.plugin`` - Name of the plugin providing the implementation.
+    - ``code.function`` - Name of the implementation function.
+    - ``datasette.hook.call_count`` *(optional)* - Number of dispatches represented by an aggregated span.
+    - ``datasette.hook.total_duration_ms`` *(optional)* - Wall time actually spent inside the hook, summed across every dispatch. Differs from the span's own duration, which runs from first dispatch to last and so also covers the work in between.
+    - ``datasette.hook.aggregated`` *(optional)* - True on a span that represents many dispatches rather than one.
 
 ``datasette.permission_check``
-    Wraps ``allowed_many()``, the choke point behind :ref:`datasette.allowed() <datasette_allowed>`, :ref:`datasette.ensure_permission() <datasette_ensure_permission>` and :ref:`datasette.check_visibility() <datasette_check_visibility>`.
+    A permission decision, covering the whole batch when several actions are resolved together.
 
     Attributes:
 
-    - ``datasette.action`` - single-action calls
-    - ``datasette.actions`` - multi-action calls
-    - ``datasette.result`` - single-action calls only
-    - ``datasette.resource`` - omitted when there is no resource
-    - ``datasette.actor_present``
-    - ``datasette.permission.cached``
+    - ``datasette.action`` *(optional)* - The permission action being checked.
+    - ``datasette.actions`` *(optional)* - The permission actions requested, when more than one was checked at once.
+    - ``datasette.resource`` *(optional)* - The resource being checked, as ``parent`` or ``parent/child``. Omitted when there is no resource.
+    - ``datasette.actor_present`` - Whether an actor was supplied. **The actor itself is never recorded.**
+    - ``datasette.permission.cached`` - True if every requested action was already resolved in this request's permission cache, meaning the span represents no work.
+    - ``datasette.result`` *(optional)* - The verdict, for a single-action check. Omitted for multi-action checks, where one attribute per action would be unbounded cardinality.
 
 ``datasette.allowed_resources``
-    Wraps :ref:`datasette.allowed_resources() <datasette_allowed_resources>`, the bulk resource-listing path.
+    The bulk resource-listing path - which tables or databases may this actor see.
 
     Attributes:
 
-    - ``datasette.action``
-    - ``datasette.resource`` - omitted when there is no parent filter
-    - ``datasette.actor_present``
-    - ``datasette.resources_returned``
+    - ``datasette.action`` *(optional)* - The permission action being checked.
+    - ``datasette.resource`` *(optional)* - The resource being checked, as ``parent`` or ``parent/child``. Omitted when there is no resource.
+    - ``datasette.actor_present`` - Whether an actor was supplied. **The actor itself is never recorded.**
+    - ``datasette.resources_returned`` - Number of resources the actor may access.
 
 ``datasette.permission_resources_sql``
-    Wraps :ref:`datasette.allowed_resources_sql() <datasette_allowed_resources_sql>`, the SQL-building and hook-gathering phase nested inside ``datasette.allowed_resources``.
+    The SQL-building and hook-gathering phase nested inside ``datasette.allowed_resources``.
 
     Attributes:
 
-    - ``datasette.action``
-    - ``datasette.resource`` - omitted when there is no parent filter
-    - ``datasette.actor_present``
-
-Response building
-~~~~~~~~~~~~~~~~~
-
-Everything above happens before the response body exists. These spans cover what happens after the SQL finishes - without them, a slow page whose queries are all fast produces a trace of quick ``db.query`` spans followed by a large unexplained gap.
+    - ``datasette.action`` *(optional)* - The permission action being checked.
+    - ``datasette.resource`` *(optional)* - The resource being checked, as ``parent`` or ``parent/child``. Omitted when there is no resource.
+    - ``datasette.actor_present`` - Whether an actor was supplied. **The actor itself is never recorded.**
 
 ``datasette.render_template``
-    Rendering a Jinja template into an HTML response. Covers template selection and context building as well as the render itself, so the plugin hooks awaited while building the context (``extra_template_vars``, ``extra_body_script`` and the asset URL hooks) nest inside it.
+    Rendering a Jinja template into an HTML response. Covers template selection and context building as well as the render, so the plugin hooks awaited while building the context nest inside it.
 
     Attributes:
 
-    - ``datasette.template`` - the selected template name, or ``<string>`` for a template built with ``from_string()``
-    - ``datasette.view_name`` - omitted when the caller did not supply one
+    - ``datasette.template`` - The selected template name, or ``<string>`` for a template built with ``from_string()``.
+    - ``datasette.view_name`` *(optional)* - The view that requested the render.
 
 ``datasette.facet_results``
     One facet class calculating its results. The SQL it runs nests inside it.
 
     Attributes:
 
-    - ``datasette.facet_type`` - ``column``, ``array`` or ``date``
+    - ``datasette.facet_type`` - The facet class type: ``column``, ``array`` or ``date``.
 
 ``datasette.facet_suggest``
-    One facet class deciding which facets to suggest, controlled by :ref:`setting_suggest_facets`. Often more expensive than the facets themselves, because suggestion probes every column.
+    One facet class deciding which facets to suggest. Often more expensive than the facets themselves, because suggestion probes every column.
 
     Attributes:
 
-    - ``datasette.facet_type``
+    - ``datasette.facet_type`` - The facet class type: ``column``, ``array`` or ``date``.
 
 ``datasette.render``
-    Dispatch to an output renderer - ``json``, or any format registered by the :ref:`plugin_register_output_renderer` hook. CSV is not included here, since it streams.
+    Dispatch to an output renderer. CSV is not included here, since it streams.
 
     Attributes:
 
-    - ``datasette.format``
-    - ``datasette.rows_returned``
+    - ``datasette.format`` - The output format, such as ``json``.
+    - ``datasette.rows_returned`` *(optional)* - Number of rows the operation returned.
 
 ``datasette.csv_stream``
-    Writing a CSV response body. This runs *after* the view has returned, while the body is being sent, and for a ``?_stream=1`` export it is where nearly all of the request's time goes.
+    Writing a CSV response body. Runs *after* the view has returned, while the body is being sent, and for a ``?_stream=1`` export is where nearly all of the request's time goes.
 
     Attributes:
 
-    - ``datasette.stream`` - true if this is a full ``?_stream=1`` export rather than a single page
-    - ``db.namespace``
-    - ``datasette.table`` - omitted for query pages
-    - ``datasette.rows_written``
-    - ``datasette.pages_fetched`` - more than one only when streaming
+    - ``datasette.stream`` - True for a full ``?_stream=1`` export rather than a single page.
+    - ``db.namespace`` - Name of the database being queried.
+    - ``datasette.table`` *(optional)* - The table being exported. Omitted for query pages.
+    - ``datasette.rows_written`` - Rows written to the response.
+    - ``datasette.pages_fetched`` - Pages of results fetched. More than one only when streaming.
+
+.. [[[end]]]
 
 Metrics reference
 -----------------
@@ -2526,66 +2533,93 @@ Spans describe requests that have finished. They cannot answer *"am I saturating
 
 All metric names use the ``datasette.*`` prefix except ``db.client.operation.duration``, which is a standard OpenTelemetry semantic convention metric.
 
-Thread pool and queue gauges
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The gauges are `observable <https://opentelemetry.io/docs/specs/otel/metrics/api/#asynchronous-gauge>`__: Datasette computes them only when something is collecting, so an instance with no metrics provider installed does no work for them at all.
 
-These are `observable gauges <https://opentelemetry.io/docs/specs/otel/metrics/api/#asynchronous-gauge>`__: Datasette computes them only when something is collecting, so an instance with no metrics provider installed does no work for them at all.
-
-``datasette.sql.threads.limit``
-    Maximum number of read queries that can run at once - the value of the :ref:`setting_num_sql_threads` setting. Not reported when ``num_sql_threads`` is ``0``, since in that mode queries run on the event loop and there is no pool.
-
-``datasette.sql.threads.queue_depth``
-    Read queries waiting for a free thread in the shared pool. **This is the saturation signal.** Sustained above zero means requests are queueing on ``num_sql_threads`` and the fix is to raise it or to reduce query cost.
-
-``datasette.sql.queries.pending``
-    Read queries submitted to the pool and not yet complete, broken down by ``db.namespace``. Summed across databases and compared against ``datasette.sql.threads.limit``, this is pool utilisation.
-
-``datasette.write.queue_depth``
-    Writes queued behind a database's single write thread, broken down by ``db.namespace``. Every database serialises all of its writes through one thread, so this is backpressure that raising ``num_sql_threads`` cannot relieve. Not reported for a database that has never been written to.
-
-``datasette.connections.open``
-    Open SQLite file connections currently tracked for closing, broken down by ``db.namespace``.
-
-Query metrics
-~~~~~~~~~~~~~
-
-These are recorded inline as queries run.
+.. [[[cog
+    from telemetry_doc import metrics
+    metrics(cog)
+.. ]]]
 
 ``db.client.operation.duration``
-    Histogram of SQL operation durations in seconds.
+    Histogram, unit ``s``. Duration of a SQL operation. The standard OpenTelemetry semantic convention metric, and the one that survives trace sampling.
 
     Attributes:
 
-    - ``db.system`` - always ``sqlite``
-    - ``db.namespace`` - the database name
-    - ``datasette.operation`` - ``read`` or ``write``
-    - ``error.type`` - the exception class name, present only when the operation failed
-
-    For a write issued with ``block=False`` this measures the enqueue rather than the write itself, matching the behaviour of the surrounding span.
+    - ``db.system``
+    - ``db.namespace``
+    - ``datasette.operation``
+    - ``error.type`` *(optional)*
 
 ``datasette.write.queue_wait``
-    Histogram, in seconds, of how long each write waited in its database's write queue before the write thread picked it up. The metric counterpart of the ``db.write.queue_wait`` span.
+    Histogram, unit ``s``. Time each write waited in its database's write queue. The metric counterpart of the ``db.write.queue_wait`` span.
+
+    Attributes:
+
+    - ``db.namespace``
 
 ``datasette.sql.queries.interrupted``
-    Counter of queries cancelled for exceeding :ref:`setting_sql_time_limit_ms`, broken down by ``db.namespace``. Worth alerting on: a rising rate means the time limit is too tight or a table has outgrown its queries.
+    Counter, unit ``{query}``. Queries cancelled for exceeding :ref:`setting_sql_time_limit_ms`. Worth alerting on: a rising rate means the limit is too tight or a table has outgrown its queries.
 
-Response building metrics
-~~~~~~~~~~~~~~~~~~~~~~~~~
+    Attributes:
+
+    - ``db.namespace``
+
+``datasette.sql.threads.limit``
+    Observable gauge, unit ``{thread}``. Maximum concurrent read queries - the :ref:`setting_num_sql_threads` value. Not reported when ``num_sql_threads`` is ``0``, since then queries run on the event loop and there is no pool.
+
+``datasette.sql.threads.queue_depth``
+    Observable gauge, unit ``{query}``. Read queries waiting for a free thread. **This is the saturation signal** - sustained above zero means requests are queueing on ``num_sql_threads``.
+
+``datasette.sql.queries.pending``
+    Observable gauge, unit ``{query}``. Read queries submitted to the pool and not yet complete. Summed across databases and compared against the thread limit, this is pool utilisation.
+
+    Attributes:
+
+    - ``db.namespace``
+
+``datasette.write.queue_depth``
+    Observable gauge, unit ``{write}``. Writes queued behind a database's single write thread. Backpressure that raising ``num_sql_threads`` cannot relieve. Not reported for a database that has never been written to.
+
+    Attributes:
+
+    - ``db.namespace``
+
+``datasette.connections.open``
+    Observable gauge, unit ``{connection}``. Open SQLite file connections currently tracked for closing.
+
+    Attributes:
+
+    - ``db.namespace``
 
 ``datasette.template.render.duration``
-    Histogram, in seconds, of time spent in :ref:`datasette_render_template`, broken down by ``datasette.template``. Template names are bounded by the templates that exist, so this is safe to break down by.
+    Histogram, unit ``s``. Time spent rendering templates. Template names are bounded by the templates that exist, so this is safe to break down by. Note that a template rendering a slot nests, so the inner render is counted twice.
+
+    Attributes:
+
+    - ``datasette.template``
 
 ``datasette.facet.duration``
-    Histogram, in seconds, of time spent on one facet, broken down by ``datasette.facet_type`` and ``datasette.facet_phase`` (``results`` or ``suggest``). Suggestion and calculation have very different costs and are worth separating.
+    Histogram, unit ``s``. Time spent on one facet. Suggestion and calculation have very different costs and are worth separating.
+
+    Attributes:
+
+    - ``datasette.facet_type``
+    - ``datasette.facet_phase``
 
 ``datasette.facets.timed_out``
-    Counter of facet calculations abandoned for exceeding :ref:`setting_facet_time_limit_ms`, broken down by ``datasette.facet_type``. A timed-out facet is dropped from the page silently, so without this metric the failure is invisible.
+    Counter, unit ``{facet}``. Facet calculations abandoned for exceeding :ref:`setting_facet_time_limit_ms`. A timed-out facet is dropped from the page silently, so without this the failure is invisible.
+
+    Attributes:
+
+    - ``datasette.facet_type``
 
 ``datasette.csv.rows_streamed``
-    Counter of rows written to CSV responses. The throughput measure for exports.
+    Counter, unit ``{row}``. Rows written to CSV responses. The throughput measure for exports.
+
+.. [[[end]]]
 
 .. note::
-    The three metrics that describe the shared thread pool - ``datasette.sql.threads.limit``, ``datasette.sql.threads.queue_depth`` and the instance as a whole - carry no attribute identifying *which* Datasette produced them. If a single Python process constructs more than one ``Datasette`` instance, their observations collide and the last one collected wins. This does not affect running Datasette normally, where a process serves exactly one instance.
+    The metrics describing the shared thread pool - ``datasette.sql.threads.limit`` and ``datasette.sql.threads.queue_depth`` - carry no attribute identifying *which* Datasette produced them. If a single Python process constructs more than one ``Datasette`` instance, their observations collide and the last one collected wins. This does not affect running Datasette normally, where a process serves exactly one instance.
 
 Privacy
 -------
