@@ -58,6 +58,9 @@ datasette = "datasette.cli:cli"
 [project.entry-points.pytest11]
 datasette = "datasette._pytest_plugin"
 
+[project.entry-points.opentelemetry_resource_detector]
+datasette = "datasette_resource_detector:DatasetteResourceDetector"
+
 [dependency-groups]
 dev = [
     "pytest>=9",

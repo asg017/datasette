@@ -159,6 +159,44 @@ OTEL_TRACES_EXPORTER=console OTEL_METRICS_EXPORTER=none OTEL_LOGS_EXPORTER=none 
 
 Then make a request and watch stdout.
 
+Add `OTEL_EXPERIMENTAL_RESOURCE_DETECTORS=datasette` and each span's `resource` block carries
+Datasette's own `service.version` (and a `service.name` default of `datasette`) without typing
+either by hand:
+
+```bash
+pip install opentelemetry-distro opentelemetry-instrumentation
+
+OTEL_TRACES_EXPORTER=console OTEL_METRICS_EXPORTER=none OTEL_LOGS_EXPORTER=none \
+OTEL_EXPERIMENTAL_RESOURCE_DETECTORS=datasette \
+OTEL_SERVICE_NAME=datasette \
+  opentelemetry-instrument datasette mydb.db
+```
+
+Real `resource` block from that run:
+
+```json
+"resource": {
+    "attributes": {
+        "telemetry.sdk.language": "python",
+        "telemetry.sdk.name": "opentelemetry",
+        "telemetry.sdk.version": "1.44.0",
+        "service.name": "datasette",
+        "service.version": "1.0a37",
+        "service.instance.id": "98bcc4b9-6589-4240-9236-5bb67c498fa4",
+        "telemetry.auto.version": "0.65b0"
+    },
+    "schema_url": ""
+}
+```
+
+`OTEL_EXPERIMENTAL_RESOURCE_DETECTORS` is required, not optional decoration: as of the pinned
+`opentelemetry-sdk`, resource detection takes a fast path that skips entry-point scanning
+entirely unless this variable names a detector (or `*`) - registering the entry point makes the
+detector discoverable, it does not make it run. And `OTEL_SERVICE_NAME=datasette` above is what
+you'd normally set anyway (see below); leave it out and `service.name` still comes from
+Datasette's detector, since it is only a default, not a value that fights an operator's explicit
+configuration.
+
 Two things that will otherwise look like bugs:
 
 - **`opentelemetry-instrument` is required.** Setting `OTEL_TRACES_EXPORTER` and running plain
