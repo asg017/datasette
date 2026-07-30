@@ -278,28 +278,34 @@ the trace named `GET /mydb/sometable` — roughly 190 spans:
 
 ### Reading the result
 
-**Ignore the ~24 tiny traces.** One request produces 25 distinct trace IDs: one real trace with ~190
-spans, and roughly 24 single-span or two-span traces from startup — `prepare_connection`,
-`register_events`, `register_actions`, `asgi_wrapper`, and the `db.query` spans that build the
-internal catalog. Those run before any request exists, so there is no root span for them to attach
-to. Measured breakdown from a real run:
+**Two tiny orphan traces, alongside the one real trace.** Startup work — `register_events`,
+`register_actions`, `register_column_types`, the internal catalog's `db.query`/`db.write.execute`
+spans, and the `prepare_connection` warm-up each of those triggers the first time a database is
+touched — runs from `invoke_startup()` before any request exists, and now shares one
+`datasette.startup` trace rather than producing a separate orphan per hook and per query.
+
+Measured on one startup plus one table-page request, with this plugin loaded — **27 distinct trace
+IDs before, 3 after**:
 
 ```
-distinct trace_ids : 25
-  1 trace  : 189 spans, root = GET /demo_cli/items
-  10 traces: root = db.query           (startup catalog queries)
-  2 traces : root = db.write.execute   (startup catalog writes)
-  ~12      : root = datasette.hook.*   (startup hooks)
+before: 27 traces                        after: 3 traces
+   1 : GET /orphans/t          98 spans     1 : GET /orphans/t          98 spans
+  13 : db.query                             1 : datasette.startup       43 spans
+   9 : db.write.* / write_wrapper           1 : datasette.hook.asgi_wrapper
+   3 : datasette.hook.register_*
+   1 : datasette.hook.asgi_wrapper
 ```
 
-To skip them in the Jaeger UI, set **Min Duration** to `10ms` in the search form, or pick the
-specific `GET /...` operation from the Operation dropdown. Both leave you with just the request.
+The one remaining orphan is dispatched before `invoke_startup()` ever runs — `asgi_wrapper`, from
+`.app()` — along with `register_output_renderer` from `Datasette.__init__` if you count from process
+start. Both are left alone rather than folded into a span held open across object construction.
+`tests/test_telemetry.py` pins the `datasette.startup` behaviour.
 
-**`db.query` spans show as `internal`, not as database calls.** Datasette emits them with
-`SpanKind.INTERNAL`, so Jaeger will not render them with its database styling even though they carry
-`db.system` / `db.namespace` / `db.query.text`. OpenTelemetry's semantic conventions say database
-client spans should be `SpanKind.CLIENT`; that is a genuine gap in the instrumentation rather than
-something to configure here.
+**`db.query` spans are `SpanKind.CLIENT`**, which is what semantic conventions say a database client
+span should be, so a trace UI can render them as database calls rather than as internal work. Their
+children — `db.query.execute`, `db.write.execute`, `db.write.queue_wait` — stay `INTERNAL`: they are
+Datasette's decomposition of one logical query, and marking them CLIENT too would make a single
+query look like several database calls.
 
 ### Why the plugin is needed
 

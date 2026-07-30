@@ -69,6 +69,7 @@ from .telemetry_registry import (
     RENDER_TEMPLATE,
     RESOURCE,
     RESOURCES_RETURNED,
+    STARTUP,
     TEMPLATE,
     VIEW_NAME,
 )
@@ -823,57 +824,70 @@ class Datasette:
         # This must be called for Datasette to be in a usable state
         if self._startup_invoked:
             return
-        # Register event classes
-        event_classes = []
-        for hook in pm.hook.register_events(datasette=self):
-            extra_classes = await await_me_maybe(hook)
-            if extra_classes:
-                event_classes.extend(extra_classes)
-        self.event_classes = tuple(event_classes)
+        # Runs once per process, before any request exists - there is no
+        # request span for any of this to nest under. Without this span,
+        # every child span created below (register_events, the internal
+        # catalog's db.query/db.write.execute spans, the prepare_connection
+        # warm-up each of those triggers on first touch of a database, ...)
+        # would be its own single- or two-span orphan trace: around twenty
+        # of them on a fresh instance, cluttering a trace UI's search
+        # results around every real request. A connection warmed later -
+        # lazily, when a request first touches a new database - nests under
+        # that request instead, since this span has ended by then.
+        with tracer.start_as_current_span(STARTUP):
+            # Register event classes
+            event_classes = []
+            for hook in pm.hook.register_events(datasette=self):
+                extra_classes = await await_me_maybe(hook)
+                if extra_classes:
+                    event_classes.extend(extra_classes)
+            self.event_classes = tuple(event_classes)
 
-        # Register actions, but watch out for duplicate name/abbr
-        action_names = {}
-        action_abbrs = {}
-        for hook in pm.hook.register_actions(datasette=self):
-            if hook:
-                for action in hook:
-                    if (
-                        action.name in action_names
-                        and action != action_names[action.name]
-                    ):
-                        raise StartupError(f"Duplicate action name: {action.name}")
-                    if (
-                        action.abbr
-                        and action.abbr in action_abbrs
-                        and action != action_abbrs[action.abbr]
-                    ):
-                        raise StartupError(f"Duplicate action abbr: {action.abbr}")
-                    action_names[action.name] = action
-                    if action.abbr:
-                        action_abbrs[action.abbr] = action
-                    self.actions[action.name] = action
+            # Register actions, but watch out for duplicate name/abbr
+            action_names = {}
+            action_abbrs = {}
+            for hook in pm.hook.register_actions(datasette=self):
+                if hook:
+                    for action in hook:
+                        if (
+                            action.name in action_names
+                            and action != action_names[action.name]
+                        ):
+                            raise StartupError(f"Duplicate action name: {action.name}")
+                        if (
+                            action.abbr
+                            and action.abbr in action_abbrs
+                            and action != action_abbrs[action.abbr]
+                        ):
+                            raise StartupError(f"Duplicate action abbr: {action.abbr}")
+                        action_names[action.name] = action
+                        if action.abbr:
+                            action_abbrs[action.abbr] = action
+                        self.actions[action.name] = action
 
-        # Register column types (classes, not instances)
-        self._column_types = {}
-        for hook in pm.hook.register_column_types(datasette=self):
-            if hook:
-                for ct_cls in hook:
-                    if ct_cls.name in self._column_types:
-                        raise StartupError(f"Duplicate column type name: {ct_cls.name}")
-                    self._column_types[ct_cls.name] = ct_cls
+            # Register column types (classes, not instances)
+            self._column_types = {}
+            for hook in pm.hook.register_column_types(datasette=self):
+                if hook:
+                    for ct_cls in hook:
+                        if ct_cls.name in self._column_types:
+                            raise StartupError(
+                                f"Duplicate column type name: {ct_cls.name}"
+                            )
+                        self._column_types[ct_cls.name] = ct_cls
 
-        for hook in pm.hook.prepare_jinja2_environment(
-            env=self._jinja_env, datasette=self
-        ):
-            await await_me_maybe(hook)
-        # Ensure internal tables and metadata are populated before startup hooks
-        await self._refresh_schemas()
-        await self._save_queries_from_config()
-        # Load column_types from config into internal DB
-        await self._apply_column_types_config()
-        for hook in pm.hook.startup(datasette=self):
-            await await_me_maybe(hook)
-        self._startup_invoked = True
+            for hook in pm.hook.prepare_jinja2_environment(
+                env=self._jinja_env, datasette=self
+            ):
+                await await_me_maybe(hook)
+            # Ensure internal tables and metadata are populated before startup hooks
+            await self._refresh_schemas()
+            await self._save_queries_from_config()
+            # Load column_types from config into internal DB
+            await self._apply_column_types_config()
+            for hook in pm.hook.startup(datasette=self):
+                await await_me_maybe(hook)
+            self._startup_invoked = True
 
     def sign(self, value, namespace="default"):
         return URLSafeSerializer(self._secret, namespace).dumps(value)

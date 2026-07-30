@@ -2447,6 +2447,11 @@ Spans are ``SpanKind.INTERNAL`` unless a kind is listed below. Only ``db.query``
     - ``datasette.isolated_connection`` - True if the write ran on its own connection rather than the shared write connection.
     - ``datasette.transaction`` - False for statements such as ``VACUUM`` that cannot run inside a transaction.
 
+``datasette.startup``
+    ``invoke_startup()`` running: ``register_events``, ``register_actions``, ``register_column_types``, ``prepare_jinja2_environment``, internal-database schema catalog refresh (including the ``prepare_connection`` warm-up this triggers for each database touched for the first time), saved queries, column type config and the ``startup`` hook. Runs once per process, before any request exists, so without this span every child it creates would be its own orphan root trace. A connection warmed later - lazily, the first time a *request* touches a new database or thread - nests under that request's own span instead, not under this one, since this span has already ended by then.
+
+    No attributes.
+
 ``datasette.hook.*``
     One plugin hook implementation running, named for the hook - for example ``datasette.hook.extra_body_script``. For an ``async def`` implementation the span covers the ``await``, not pluggy's synchronous dispatch. A few very high-frequency hooks - currently ``render_cell`` and ``permission_resources_sql`` - are aggregated instead, producing one span per plugin per request carrying ``datasette.hook.call_count`` rather than one span per dispatch. Aggregation applies only inside a request; the same hooks dispatched from CLI or plugin code still get a span each.
 
