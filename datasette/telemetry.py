@@ -164,11 +164,24 @@ def sql_operation_name(sql: str) -> str | None:
 #    out of their way not to do. The "user" mode exists to structurally
 #    prevent that, rather than relying on a denylist of parameter names.
 #
-# 2. Canned queries can bind cookies and headers. The _cookie_* and _header_*
-#    magic parameters resolve to request cookies and headers, so a canned
-#    query can bind a session cookie or an Authorization header as an
-#    ordinary SQL parameter. No mode protects against that, because those
-#    queries run against user databases - it is documented instead.
+# 2. Canned queries can bind cookies and headers - but their values do not
+#    reach a span, for a reason that is incidental rather than designed and
+#    is therefore pinned by a test. The _cookie_*, _header_* and _actor_*
+#    magic parameters resolve to values from the request, and a canned query
+#    binding one really does receive it. But `MagicParameters` (a dict
+#    subclass in views/database.py) resolves them in `__getitem__`, storing
+#    the result in a private `_prepared` dict rather than in its own
+#    storage. sqlite3 binds by name, which goes through `__getitem__` and so
+#    sees the resolved value; `parameter_attributes()` below iterates
+#    `.items()`, which is dict's own C-level method and never calls the
+#    override - so it sees only the raw request arguments the dict was built
+#    from, never a resolved secret.
+#
+#    That is one refactor away from silently reopening: storing resolved
+#    values with `dict.__setitem__` would make every one of them a span
+#    attribute. test_telemetry_parameters.py asserts a cookie and a header
+#    bound by a canned query never appear in any span, so the day that
+#    changes, the suite says so.
 
 TRACE_SQL_PARAMETER_MODES = ("off", "user", "all")
 

@@ -192,3 +192,68 @@ def test_invalid_mode_fails_loudly_at_startup():
         Datasette(memory=True, settings={"trace_sql_parameters": "yes"})
     assert "trace_sql_parameters" in str(excinfo.value)
     assert "'off', 'user', 'all'" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_magic_parameters_never_reach_a_span(otel_spans):
+    """
+    A canned query binding a cookie or a header must not export it, even
+    under 'all' - the most permissive mode, on a user database, which is the
+    worst case.
+
+    This is a regression test rather than a test of a designed guard, and the
+    distinction matters. `MagicParameters` resolves `_cookie_*`/`_header_*`
+    in `__getitem__`, keeping the result in a private `_prepared` dict.
+    SQLite binds by name and so goes through that override and receives the
+    real value - the assertions below check the query genuinely resolved,
+    otherwise this test would pass on a query that simply did not work.
+    `parameter_attributes()` iterates `.items()`, dict's own C-level method,
+    which never calls the override and therefore never sees the resolved
+    value.
+
+    Nothing enforces that arrangement. Storing resolved values with
+    `dict.__setitem__` - a plausible simplification - would put every cookie
+    and Authorization header a canned query touches into a span attribute,
+    on an instance whose operator opted into parameter recording for
+    ordinary queries. So this pins it.
+    """
+    cookie_value = "COOKIE_" + SECRET
+    header_value = "Bearer HEADER_" + SECRET
+    ds = Datasette(
+        memory=True,
+        settings={"trace_sql_parameters": "all"},
+        config={
+            "databases": {
+                "magic": {
+                    "queries": {
+                        "peek_cookie": {"sql": "select :_cookie_ds_session as v"},
+                        "peek_header": {"sql": "select :_header_authorization as v"},
+                    }
+                }
+            }
+        },
+    )
+    ds.add_memory_database("magic")
+    await ds.invoke_startup()
+    otel_spans.clear()
+
+    cookie_response = await ds.client.get(
+        "/magic/peek_cookie.json?_shape=array", cookies={"ds_session": cookie_value}
+    )
+    header_response = await ds.client.get(
+        "/magic/peek_header.json?_shape=array",
+        headers={"authorization": header_value},
+    )
+    # The magic parameters really did resolve - without this the test would
+    # pass just as well against a query that bound nothing at all.
+    assert cookie_response.json() == [{"v": cookie_value}]
+    assert header_response.json() == [{"v": header_value}]
+
+    exported = [
+        (span.name, key, value)
+        for span in otel_spans.get_finished_spans()
+        for key, value in (span.attributes or {}).items()
+        if isinstance(value, str) and (cookie_value in value or header_value in value)
+    ]
+    assert not exported, f"a magic parameter's value reached a span: {exported}"
+    ds.close()
