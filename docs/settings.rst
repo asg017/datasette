@@ -375,7 +375,7 @@ Defaults to ``off``, and only has any effect when an OpenTelemetry SDK provider 
 
     **Permission checks bind the actor.** Datasette's permission SQL binds the actor as a JSON parameter on every check, against the internal database. Under ``all`` your traces will therefore contain actor identity - including whatever else your actor dictionaries hold. ``user`` exists specifically to prevent this, which is why it excludes the internal database rather than filtering by parameter name.
 
-    **Canned queries can bind cookies and headers.** The ``_cookie_*`` and ``_header_*`` magic parameters resolve to values from the incoming request, so a canned query using them can bind a session cookie or an ``Authorization`` header as an ordinary SQL parameter. Those queries run against your databases, so ``user`` does **not** protect against this. Review your canned queries before enabling either mode.
+    **Magic parameters are not recorded.** The ``_cookie_*``, ``_header_*`` and ``_actor_*`` magic parameters resolve to values from the incoming request, so a canned query using them binds a session cookie or an ``Authorization`` header as an ordinary SQL parameter - but those resolved values never reach a span, in any mode. A canned query's parameters are held in a dictionary that resolves magic values only when SQLite asks for them by name, and the code that records parameters does not go through that path. A test pins this, because it is a property of how magic parameters happen to be implemented rather than a deliberate guard.
 
     Parameter values are truncated, and blob parameters are recorded as ``<bytes[N]>`` rather than by content, but neither mitigation makes this setting safe to enable without thought.
 
