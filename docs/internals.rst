@@ -2398,6 +2398,22 @@ Setting ``OTEL_TRACES_EXPORTER=console`` against a plain ``datasette`` process d
 
 The default ``BatchSpanProcessor`` buffers spans before writing them out, so output can take up to ten seconds to appear after a request completes. Give it a few seconds, or stop the process, which triggers a final flush.
 
+Resource attributes
+-------------------
+
+A `Resource <https://opentelemetry.io/docs/specs/otel/resource/sdk/>`__ describes the process producing telemetry - things like ``service.name`` and ``service.version`` - and is normally left entirely to whoever runs Datasette, via ``OTEL_SERVICE_NAME`` and ``OTEL_RESOURCE_ATTRIBUTES``. Datasette also ships a `resource detector <https://opentelemetry.io/docs/specs/otel/resource/sdk/#detector>`__, registered under the ``opentelemetry_resource_detector`` entry point group as ``datasette``, that contributes ``service.version`` - the running Datasette version - and a ``service.name`` default of ``datasette``, so a trace is at least labelled correctly without hand-typing (and maintaining, across upgrades) a version string yourself.
+
+This detector lives outside the ``datasette`` package, in a small sibling distribution module, because it necessarily subclasses an OpenTelemetry **SDK** class (``opentelemetry.sdk.resources.ResourceDetector``) - and Datasette core depends on ``opentelemetry-api`` only, never the SDK. Nothing under ``import datasette`` reaches it; only the SDK's own entry-point loader ever imports it, which happens only when the SDK is already installed and running.
+
+Registering the entry point makes the detector discoverable, but does not make it run on its own. As of the pinned ``opentelemetry-sdk``, ``Resource.create()`` only scans ``opentelemetry_resource_detector`` entry points when the `experimental <https://opentelemetry-python.readthedocs.io/en/latest/sdk/environment_variables.html#opentelemetry.sdk.environment_variables.OTEL_EXPERIMENTAL_RESOURCE_DETECTORS>`__ ``OTEL_EXPERIMENTAL_RESOURCE_DETECTORS`` environment variable names this detector - its entry point name, ``datasette`` - or ``*``; otherwise it takes a fast path that returns only the SDK's own built-in detectors and never touches entry points at all. Opt in with:
+
+.. code-block:: bash
+
+    OTEL_EXPERIMENTAL_RESOURCE_DETECTORS=datasette \
+      opentelemetry-instrument datasette mydb.db
+
+Adding ``OTEL_SERVICE_NAME=my-service`` alongside it always wins over the ``service.name`` default Datasette contributes, while still keeping ``service.version``: the SDK always runs its own ``otel`` resource detector - the one that reads ``OTEL_SERVICE_NAME`` and ``OTEL_RESOURCE_ATTRIBUTES`` - after every entry-point-registered detector, unless it is explicitly reordered in ``OTEL_EXPERIMENTAL_RESOURCE_DETECTORS``, and a later detector's attributes win when resources are merged.
+
 Span reference
 --------------
 
