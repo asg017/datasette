@@ -164,8 +164,15 @@ HOOK_CALL_COUNT = Attribute(
 HOOK_TOTAL_DURATION_MS = Attribute(
     "datasette.hook.total_duration_ms",
     "Wall time actually spent inside the hook, summed across every dispatch. "
-    "Differs from the span's own duration, which runs from first dispatch to "
-    "last and so also covers the work in between.",
+    "This is also the aggregate span's own duration - deliberately, so that a "
+    "hook dispatched at spread-out points does not appear as one long span "
+    "covering everything that happened between its first and last call.",
+    optional=True,
+)
+HOOK_WINDOW_MS = Attribute(
+    "datasette.hook.window_ms",
+    "First dispatch to last, including everything Datasette did in between. "
+    "Deliberately not the span's duration - see ``datasette.hook.total_duration_ms``.",
     optional=True,
 )
 HOOK_AGGREGATED = Attribute(
@@ -289,10 +296,20 @@ HOOK = SpanName(
     "datasette.hook.",
     "One plugin hook implementation running, named for the hook - for example "
     "``datasette.hook.extra_body_script``. For an ``async def`` implementation "
-    "the span covers the ``await``, not pluggy's synchronous dispatch. Hooks "
-    "dispatched per row or per cell are aggregated into one span per request "
-    "rather than one span per dispatch.",
-    (PLUGIN, CODE_FUNCTION, HOOK_CALL_COUNT, HOOK_TOTAL_DURATION_MS, HOOK_AGGREGATED),
+    "the span covers the ``await``, not pluggy's synchronous dispatch. A few "
+    "very high-frequency hooks - currently ``render_cell`` and "
+    "``permission_resources_sql`` - are aggregated instead, producing one span "
+    "per plugin per request carrying ``datasette.hook.call_count`` rather than "
+    "one span per dispatch. Aggregation applies only inside a request; the same "
+    "hooks dispatched from CLI or plugin code still get a span each.",
+    (
+        PLUGIN,
+        CODE_FUNCTION,
+        HOOK_CALL_COUNT,
+        HOOK_TOTAL_DURATION_MS,
+        HOOK_WINDOW_MS,
+        HOOK_AGGREGATED,
+    ),
     prefix=True,
 )
 

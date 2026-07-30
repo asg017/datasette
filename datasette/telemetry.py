@@ -34,6 +34,7 @@ from .telemetry_registry import (
     HOOK_AGGREGATED,
     HOOK_CALL_COUNT,
     HOOK_TOTAL_DURATION_MS,
+    HOOK_WINDOW_MS,
     M_CONNECTIONS_OPEN,
     M_CSV_ROWS_STREAMED,
     M_FACET_DURATION,
@@ -128,12 +129,40 @@ def parameter_attributes(params):
         yield DB_QUERY_PARAMETER.replace("<name>", str(key)), _parameter_value(value)
 
 
-# Hooks that Datasette dispatches from inside per-row/per-cell loops. A single
-# 100 row x 15 column table page dispatches render_cell ~1,500 times; one span
-# per dispatch would blow straight through BatchSpanProcessor's default
+# Hooks dispatched so often that one span per dispatch is worse than useless.
+# These are counted and timed into a single aggregate span per (hook, plugin)
+# pair per request instead, carrying datasette.hook.call_count and
+# datasette.hook.total_duration_ms.
+#
+# render_cell is dispatched from inside per-row/per-cell loops. A single
+# 100 row x 15 column table page dispatches it ~1,500 times; one span per
+# dispatch would blow straight through BatchSpanProcessor's default
 # max_queue_size of 2048 and silently drop every other span in the request.
-# These are counted and timed into a single aggregate span per request instead.
-AGGREGATED_HOOKS = frozenset({"render_cell"})
+#
+# permission_resources_sql is dispatched once per unique action per
+# implementing plugin. Measured on a table page: 16 gathers x 6 core hookimpls
+# = 96 spans, 45% of the whole trace. Two things make aggregating it right
+# rather than merely convenient:
+#
+#   - The hook does no I/O. It returns PermissionSQL *fragments*, which are
+#     concatenated into one CTE per action; those 96 dispatches produce 3
+#     actual SQL executions, and 42 of them produce none at all because every
+#     implementation returned None and the caller short-circuits to
+#     default-deny. There is no latency hiding in an individual dispatch.
+#   - The span costs more than the work it measures. Measured per dispatch:
+#     0.029us raw, 8.09us wrapped with a span, 0.425us aggregated. Across 96
+#     dispatches that is ~0.74ms of span overhead for ~0.03ms of hook time.
+#     Note this does *not* show up end to end: 0.74ms is ~2% of a 32ms table
+#     page, well inside the +/-3ms run-to-run spread, and a before/after
+#     benchmark could not resolve it. The honest claim is trace quality, not
+#     speed.
+#
+# What is lost is the parent link to the individual permission_check - the
+# aggregate hangs off the request instead. For a hook that does no I/O that is
+# not worth 90 spans. Per-plugin attribution survives, so a third-party
+# permission plugin that *does* do I/O here still shows up, in
+# total_duration_ms; if one ever does, un-aggregate it.
+AGGREGATED_HOOKS = frozenset({"render_cell", "permission_resources_sql"})
 
 # Per-request accumulator for AGGREGATED_HOOKS. None outside a request.
 _hook_aggregate = ContextVar("datasette_hook_aggregate", default=None)
@@ -158,6 +187,28 @@ def aggregate_hook_spans():
 
 
 def _flush_hook_aggregate(bucket):
+    """
+    Emit one span per (hook, plugin) for the dispatches accumulated this
+    request.
+
+    **The span's duration is the summed time spent inside the hook, not the
+    window from first dispatch to last.** Those are wildly different numbers
+    for a hook dispatched at spread-out points, and using the window makes a
+    trace actively lie: permission_resources_sql fires at the start of a
+    request and again during template rendering, so its window is ~43ms while
+    the hook itself consumes ~0.04ms. A span drawn 1000x wider than its work
+    lands at the top of every "slowest spans" list, which is the first thing
+    anyone looks at when a page is slow.
+
+    An earlier version used first_start -> last_end and recorded the real
+    figure only in an attribute. That was wrong: nobody reads an attribute to
+    sanity-check a bar that is already sorted to the top. The window is still
+    available as datasette.hook.window_ms for anyone who wants it.
+
+    The start time is kept at the first dispatch, so the span sits where the
+    work began. It is one contiguous bar standing in for N scattered ones, so
+    the position is honest and only the contiguity is a simplification.
+    """
     for (hook_name, plugin_name, function_name), stats in bucket.items():
         span = tracer.start_span(
             HOOK + hook_name,
@@ -166,14 +217,16 @@ def _flush_hook_aggregate(bucket):
                 PLUGIN: plugin_name,
                 CODE_FUNCTION: function_name,
                 HOOK_CALL_COUNT: stats["count"],
-                # Wall time actually spent inside the hook, summed across every
-                # dispatch. The span's own duration spans first dispatch to last
-                # and so also covers the work in between them.
                 HOOK_TOTAL_DURATION_MS: stats["total_ns"] / 1e6,
+                # First dispatch to last, including everything Datasette did
+                # in between. Recorded because "these calls were spread across
+                # the whole request" is real information - it just must not be
+                # the span's duration.
+                HOOK_WINDOW_MS: (stats["last_end"] - stats["first_start"]) / 1e6,
                 HOOK_AGGREGATED: True,
             },
         )
-        span.end(end_time=stats["last_end"])
+        span.end(end_time=stats["first_start"] + stats["total_ns"])
 
 
 def _record_aggregate(bucket, key, started, ended):
