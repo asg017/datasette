@@ -2324,6 +2324,8 @@ Turning telemetry on is entirely an operational decision made outside of Dataset
 
 Datasette emits two signals: **traces**, which answer "what happened during this request", and **metrics**, which answer "what is this process doing right now" and survive trace sampling.
 
+Everything Datasette emits carries the instrumentation scope ``datasette``, versioned with the running Datasette version and declaring the `semantic conventions schema <https://opentelemetry.io/docs/specs/otel/schemas/>`__ its attribute names follow. In an OTLP export that appears on the scope; in a Prometheus scrape it appears as the ``otel_scope_name``, ``otel_scope_version`` and ``otel_scope_schema_url`` labels, so a dashboard can be filtered to one Datasette version during a rollout.
+
 Turning tracing on
 ------------------
 

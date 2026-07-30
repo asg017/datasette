@@ -9,7 +9,8 @@ pytest.importorskip("opentelemetry.sdk")
 from opentelemetry.trace import StatusCode
 
 from datasette.database import Database
-from datasette.telemetry import MAX_SQL_LENGTH, sql_attribute, tracer
+from datasette.telemetry import MAX_SQL_LENGTH, SCHEMA_URL, sql_attribute, tracer
+from datasette.version import __version__
 
 SECRET_PARAM_VALUE = "SUPER_SECRET_PARAM_VALUE_XYZ_123"
 
@@ -44,6 +45,53 @@ async def test_db_query_span_basic_attributes(ds_client, otel_spans):
     assert span.attributes["datasette.truncated"] is False
     assert isinstance(span.attributes["datasette.time_limit_ms"], int)
     assert span.status.status_code == StatusCode.UNSET
+
+
+@pytest.mark.asyncio
+async def test_instrumentation_scope_has_version_and_schema_url(
+    ds_client, otel_spans, otel_metrics
+):
+    """
+    Every span and metric names the Datasette version that produced it and
+    the semconv schema its attribute names follow.
+
+    Before `get_tracer()` and `get_meter()` were given a version and a schema
+    URL, every scope exported was `name='datasette' version='' schema_url=''`,
+    so nothing downstream could tell which Datasette a span came from.
+
+    One request produces both a `db.query` span and a
+    `db.client.operation.duration` point, so both scopes come from the same
+    request.
+    """
+    response = await ds_client.get("/fixtures/-/query.json?sql=select+1")
+    assert response.status_code == 200
+
+    spans = _db_query_spans(otel_spans)
+    assert spans, "expected at least one db.query span"
+    span_scope = spans[-1].instrumentation_scope
+    assert span_scope.name == "datasette"
+    assert span_scope.version == __version__
+    assert span_scope.schema_url == SCHEMA_URL
+
+    # MetricsCollector.collect() keeps only data points and flattens the scope
+    # away, so the reader is walked directly here.
+    data = otel_metrics.reader.get_metrics_data()
+    metric_scopes = {
+        scope_metrics.scope.name: scope_metrics.scope
+        for resource_metrics in data.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+    }
+    assert "datasette" in metric_scopes, f"no datasette scope in {list(metric_scopes)}"
+    metric_scope = metric_scopes["datasette"]
+    assert metric_scope.version == __version__
+    assert metric_scope.schema_url == SCHEMA_URL
+
+    # The version and the URL are compared against the same constants the
+    # instrumentation is built from, so those comparisons cannot catch a wrong
+    # *value* - only a dropped argument, which is what they are for. These two
+    # check the values themselves are the shape they claim to be.
+    assert __version__, "the scope version must not be empty"
+    assert SCHEMA_URL.startswith("https://opentelemetry.io/schemas/")
 
 
 def test_sql_attribute_truncates_at_2048():
