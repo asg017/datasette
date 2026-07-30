@@ -17,7 +17,12 @@ from opentelemetry import context as otel_context_api
 from opentelemetry.trace import Status, StatusCode
 
 from .inspect import inspect_hash
-from .telemetry import sql_attribute, tracer
+from .telemetry import (
+    parameter_attributes,
+    should_record_parameters,
+    sql_attribute,
+    tracer,
+)
 from .utils import (
     call_with_supported_arguments,
     detect_fts,
@@ -105,6 +110,22 @@ class Database:
     def _check_not_closed(self):
         if self._closed:
             raise DatasetteClosedError(f"Database {self.name!r} has been closed")
+
+    def _record_parameters(self, span, params):
+        """
+        Attach SQL parameter values to a span, if the operator opted in.
+
+        Off by default. The "user" mode deliberately excludes the internal
+        database, because permission SQL binds the actor as a parameter -
+        see the note in datasette/telemetry.py.
+        """
+        from .app import INTERNAL_DB_NAME
+
+        mode = self.ds.setting("trace_sql_parameters")
+        if not should_record_parameters(mode, self.name == INTERNAL_DB_NAME):
+            return
+        for name, value in parameter_attributes(params):
+            span.set_attribute(name, value)
 
     def _remove_pending_execute_future(self, future):
         with self._pending_execute_futures_lock:
@@ -267,6 +288,7 @@ class Database:
             span.set_attribute("db.query.text", sql_attribute(sql))
             if params:
                 span.set_attribute("datasette.param_count", len(params))
+                self._record_parameters(span, params)
             results = await self.execute_write_fn(
                 _inner, block=block, request=request, transaction=transaction
             )
@@ -676,6 +698,7 @@ class Database:
             span.set_attribute("datasette.time_limit_ms", time_limit_ms)
             if params:
                 span.set_attribute("datasette.param_count", len(params))
+                self._record_parameters(span, params)
             try:
                 results = await self.execute_fn(sql_operation_in_thread)
             except QueryInterrupted as e:
