@@ -5,7 +5,8 @@ creates a `TracerProvider`, never configures an exporter, and never sets a sampl
 installed every span is a no-op and costs approximately nothing.
 
 That means "turning tracing on" is entirely the job of whoever runs Datasette. This directory shows
-two ways to do it, neither of which needs any external service.
+three ways to do it, **none of which needs Docker, a collector, or any external service** — the
+third is a real OTLP export over the wire, received by a small Python script.
 
 ## 1. A span waterfall, in about ten seconds
 
@@ -87,10 +88,63 @@ Two things that will otherwise look like bugs:
   auto-configuration, which only runs under the agent — and core never installs a provider itself.
 - **Output is not instant.** The default `BatchSpanProcessor` flushes roughly every 10 seconds.
 
-## 3. Sending it somewhere real
+## 3. A real OTLP export, still with no Docker
 
-Any OTLP-compatible backend works, via the standard agent — Datasette needs no configuration of its
-own:
+The console exporter proves spans exist, but not that they survive a real export. `otlp_receiver.py`
+is a ~120 line OTLP/HTTP receiver that closes that gap — real protobuf, over the wire, no collector
+and no containers.
+
+Terminal 1:
+
+```bash
+uv run --with opentelemetry-proto python demos/otel/otlp_receiver.py
+```
+
+Terminal 2:
+
+```bash
+OTEL_TRACES_EXPORTER=otlp \
+OTEL_METRICS_EXPORTER=none \
+OTEL_LOGS_EXPORTER=none \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+OTEL_SERVICE_NAME=datasette \
+  uv run --with opentelemetry-exporter-otlp-proto-http \
+    opentelemetry-instrument datasette mydb.db
+```
+
+Load a page, wait ~10s for the batch flush, then Ctrl-C the receiver. Real output from one request
+against a 200-row table:
+
+```
+received 35 spans (35 total)
+received 186 spans (221 total)
+
+=== 221 spans ===
+  datasette.hook.permission_resources_sql         96       8.32ms total
+  db.query                                        43      21.57ms total
+  db.query.execute                                42       9.94ms total
+  datasette.permission_check                      15       4.83ms total
+  db.write.queue_wait                              3       0.61ms total
+  db.write.execute                                 3       5.82ms total
+  ...
+
+slowest spans:
+       5.47ms  db.write.execute
+       3.23ms  db.query
+       2.26ms  datasette.permission_check
+```
+
+Note `db.write.queue_wait` and `db.write.execute` appearing separately — that is the distinction
+between "the write was slow" and "the write waited behind another writer".
+
+The receiver is a debugging aid, not a backend: nothing is persisted, it speaks OTLP/HTTP only (not
+gRPC), and it ignores metrics and logs.
+
+## 4. Sending it to a real backend
+
+Any OTLP-compatible backend works through the same agent — Datasette needs no configuration of its
+own. Point the endpoint at your collector instead of the demo receiver:
 
 ```bash
 pip install opentelemetry-distro opentelemetry-exporter-otlp opentelemetry-instrumentation-asgi
@@ -100,12 +154,12 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
 ```
 
 Adding `opentelemetry-instrumentation-asgi` is worthwhile: it creates the per-request root span that
-Datasette's spans then nest underneath. Without it you get correctly nested Datasette spans, but no
-enclosing HTTP span.
+Datasette's spans nest underneath. Without it the nesting among Datasette's own spans is still
+correct, but there is no enclosing HTTP span — which is why the demo receiver reports 75 root spans
+rather than one per request.
 
-This third path is not exercised by anything in this directory and has not been verified end to end
-against a running collector — it is the standard OpenTelemetry agent contract, documented here for
-completeness.
+This last path is the standard OpenTelemetry agent contract, documented for completeness; it has not
+been verified here against a specific vendor's collector.
 
 ## Privacy
 
