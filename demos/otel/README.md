@@ -370,6 +370,48 @@ traces per page instead of one request.
 This last path is the standard OpenTelemetry agent contract, documented for completeness; it has not
 been verified here against a specific vendor's collector.
 
+## 7. Exemplars: linking a metric spike to a trace
+
+Once both signals are on — an SDK tracer provider as well as a metrics one, which is what the agent
+in sections 4 to 6 installs — each histogram measurement also carries the trace of the request that
+produced it, with no extra configuration on Datasette's side. The SDK attaches the current trace ID
+and span ID to any measurement recorded inside a sampled span, and every metric on the query path is
+recorded inside one. (The metrics demo in section 2 installs no tracer provider, so it shows none of
+this.) Four queries of increasing cost, each in its own span, produced one exemplar per query on
+`db.client.operation.duration`:
+
+```
+db.client.operation.duration count=4
+  exemplars: 4
+    value=0.001564s trace_id=ddfaf45fd4e14913497d7efeac95f381 span_id=fd5792bdbb01e533
+    value=0.006320s trace_id=34aea775ade11a3c5f716695731000fe span_id=25ed9e29dd84dbee
+    value=0.045253s trace_id=a65cb58d1460a179f0d04046ff51ed0d span_id=7f34d6378c85d062
+    value=0.305240s trace_id=6089f4c515c221c0ca7bb53667b37ac8 span_id=0516f4a6641eaa0b
+```
+
+Exemplars are kept one per histogram bucket, so bucket boundaries decide how many distinct traces a
+metric can point at. The same four queries, run against an earlier set of bucket boundaries under
+which all four fell into a single `(0, 5]` second bucket, produced one exemplar instead of four —
+fixing the boundaries changed more than the quantiles, it also multiplied the traces reachable from
+this metric.
+
+**The pinned `opentelemetry-exporter-prometheus` (`0.65b0`) does not emit exemplars at all** — the
+word `exemplar` does not appear anywhere in its source, and rendering the workload above through
+that exporter in the OpenMetrics format — the only exposition format that can carry an exemplar —
+produced zero exemplar markers.
+The OTLP exporter carries exemplars through unchanged, so if they need to reach Prometheus, route
+them through an OTLP collector rather than through Datasette's own Prometheus exporter. On that path,
+the Prometheus server needs `--enable-feature=exemplar-storage` and a scrape in the OpenMetrics
+format — its default text format has no syntax for exemplars — and Grafana needs the Prometheus data
+source's exemplar configuration (`exemplarTraceIdDestinations`) pointed at a tracing data source
+before it draws one as a clickable point. See the `internals_telemetry` section of the main docs for
+both, with links to the primary sources.
+
+An exemplar only exists for a trace that was sampled. With the tracer provider's sampler set to
+`ALWAYS_OFF`, the same workload produced `exemplars: 0` on every data point rather than a link to a
+trace that was never kept — at low sampling rates most measurements carry no exemplar, but the ones
+that do always resolve to a real trace.
+
 ## Privacy
 
 `db.query.text` **is** recorded on spans, truncated to 2048 characters. SQL **parameter values are
