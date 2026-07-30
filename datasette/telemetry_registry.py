@@ -172,7 +172,12 @@ PLUGIN = Attribute(
 CODE_FUNCTION = Attribute("code.function", "Name of the implementation function.")
 HOOK_CALL_COUNT = Attribute(
     "datasette.hook.call_count",
-    "Number of dispatches represented by an aggregated span.",
+    "Number of dispatches represented by an aggregated span. Counts "
+    "dispatches that were **awaited**, not dispatches attempted: "
+    "``render_cell`` stops awaiting once a plugin returns a non-``None`` "
+    "result, and a plugin whose coroutine is never awaited never runs, so "
+    "there is nothing to time or count. Such a plugin is absent from the "
+    "trace rather than present with a low count.",
     optional=True,
 )
 HOOK_TOTAL_DURATION_MS = Attribute(

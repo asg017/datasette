@@ -9,13 +9,14 @@ of the await reports ~0ms for exactly the plugins worth measuring.
 """
 
 import asyncio
+import gc
 from contextlib import contextmanager
 
 import pytest
 
 pytest.importorskip("opentelemetry.sdk")
 
-from datasette import hookimpl
+from datasette import hookimpl, telemetry
 from datasette.plugins import pm
 
 SLEEP_SECONDS = 0.05
@@ -162,6 +163,177 @@ async def test_render_cell_aggregated_into_one_span(ds_client, otel_spans):
     assert span.attributes["datasette.hook.call_count"] > 100
     assert span.attributes["datasette.hook.total_duration_ms"] >= 0
     assert span.attributes["code.function"] == "render_cell"
+
+
+@pytest.mark.asyncio
+# Discarding the coroutine is the whole point of this test, and Python says so
+# when it is collected - twice, for the wrapper and for the plugin's own
+# coroutine inside it. Both warnings are Datasette's pre-existing dispatch
+# behaviour rather than anything this instrumentation introduced, and they are
+# filtered here so they do not read as noise in the suite output.
+@pytest.mark.filterwarnings(
+    "ignore:coroutine .* was never awaited:RuntimeWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+)
+async def test_short_circuited_hook_leaves_no_abandoned_span(otel_spans, monkeypatch):
+    """
+    render_cell breaks its dispatch loop on the first non-None result (see
+    datasette/views/table.py and the other two render_cell call sites), so
+    once one plugin answers, a later plugin's coroutine is constructed by
+    pluggy's multicall but never awaited.
+
+    This exercises `instrument_hookimpl` directly rather than going through
+    `pm.hook.render_cell(...)`, for two reasons:
+
+    - `pm` is the process-wide plugin manager and already carries real
+      render_cell implementations from tests/plugins/my_plugin.py and
+      my_plugin_2.py (loaded for the whole session), so a raw
+      `pm.hook.render_cell(...)` call here would dispatch those too and
+      make the result list's shape a moving target unrelated to what this
+      test is checking.
+    - render_cell is dispatched with no aggregation window open only when
+      it runs outside a request (`aggregate_hook_spans()` is entered once
+      per request by `DatasetteRouter.__call__`); inside a request it goes
+      through the aggregation path, which never starts a real span for a
+      dispatch that is never awaited (there is nothing to flush - see
+      `test_short_circuited_render_cell_undercounts_in_aggregate` below).
+      `instrument_hookimpl` is the one piece of code both paths share, and
+      is exactly what this ticket is about, so testing it directly reaches
+      the code that genuinely had "started, never ended" spans.
+
+    An unended span is invisible to `otel_spans.get_finished_spans()` -
+    that invisibility is exactly the silent span loss at issue. So this
+    test cannot tell "no span was ever started" apart from "a span was
+    started and never ended" by looking at finished spans alone; it has to
+    watch `tracer.start_span` itself to catch a Span object that was
+    started but never reached `span.end()`.
+    """
+    started_spans = []
+    real_start_span = telemetry.tracer.start_span
+
+    def capturing_start_span(name, *args, **kwargs):
+        span = real_start_span(name, *args, **kwargs)
+        if name == "datasette.hook.render_cell":
+            started_spans.append(span)
+        return span
+
+    monkeypatch.setattr(telemetry.tracer, "start_span", capturing_start_span)
+
+    def first_plugin_render_cell(value, column):
+        async def inner():
+            return "/* first */"
+
+        return inner()
+
+    def second_plugin_render_cell(value, column):
+        async def inner():
+            return "/* second */"
+
+        return inner()
+
+    first_wrapper = telemetry.instrument_hookimpl(
+        "render_cell", "first-to-respond", first_plugin_render_cell
+    )
+    second_wrapper = telemetry.instrument_hookimpl(
+        "render_cell", "never-awaited", second_plugin_render_cell
+    )
+
+    # Mirrors the dispatch loop in datasette/views/table.py exactly: call
+    # each hookimpl (pluggy's multicall, done here by hand), await results
+    # in order, stop at the first non-None one - leaving whichever
+    # coroutine comes later un-awaited.
+    results = [
+        first_wrapper(value="x", column="c"),
+        second_wrapper(value="x", column="c"),
+    ]
+    plugin_display_value = None
+    for candidate in results:
+        candidate = await candidate
+        if candidate is not None:
+            plugin_display_value = candidate
+            break
+    assert plugin_display_value == "/* first */"
+
+    # Drop the last reference to the abandoned coroutine and force
+    # collection, so that - before the fix - its span would have every
+    # chance to be finalized if anything were watching for that.
+    del results, candidate
+    gc.collect()
+    await asyncio.sleep(0)
+
+    unended = [s for s in started_spans if s.end_time is None]
+    assert not unended, (
+        f"{len(unended)} span(s) were started and never ended: "
+        f"{[s.attributes.get('datasette.plugin') for s in unended]}"
+    )
+    # And the one that *was* awaited must have produced a normal, exported
+    # span - the fix must not have also suppressed that one.
+    ended = [s for s in started_spans if s.end_time is not None]
+    assert len(ended) == 1
+    assert ended[0].attributes.get("datasette.plugin") == "first-to-respond"
+
+
+@pytest.mark.asyncio
+# Same discard, reached through a real request this time: the losing plugin's
+# coroutine - and the aggregate wrapper around it - are collected un-awaited.
+# That happens on any page where two render_cell plugins are registered and
+# the first one answers; it predates this instrumentation.
+@pytest.mark.filterwarnings(
+    "ignore:coroutine .* was never awaited:RuntimeWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+)
+async def test_short_circuited_render_cell_undercounts_in_aggregate(
+    ds_client, otel_spans
+):
+    """
+    Inside a request, render_cell dispatches go through the aggregation path
+    (AGGREGATED_HOOKS). `_record_aggregate` only runs from inside the
+    coroutine handed back to the caller, so a plugin whose coroutine is
+    never awaited - because an earlier plugin already returned a non-None
+    value - is never recorded at all: not undercounted in the sense of a
+    wrong number, but entirely absent from the aggregate, with no span for
+    it whatsoever.
+
+    This is the documented, accepted shape of the call_count undercount -
+    see HOOK_CALL_COUNT's description in telemetry_registry.py.
+    """
+
+    class AlwaysWins:
+        __name__ = "AlwaysWins"
+
+        @hookimpl(tryfirst=True)
+        def render_cell(self, value, column):
+            async def inner():
+                return "/* always wins */"
+
+            return inner()
+
+    class NeverReached:
+        __name__ = "NeverReached"
+
+        @hookimpl
+        def render_cell(self, value, column):
+            async def inner():
+                return "/* never reached */"
+
+            return inner()
+
+    with (
+        register(AlwaysWins(), "always-wins"),
+        register(NeverReached(), "never-reached"),
+    ):
+        response = await ds_client.get("/fixtures/compound_three_primary_keys")
+    assert response.status_code == 200
+
+    winner_spans = hook_spans(otel_spans, "render_cell", plugin="always-wins")
+    loser_spans = hook_spans(otel_spans, "render_cell", plugin="never-reached")
+
+    assert len(winner_spans) == 1
+    assert winner_spans[0].attributes["datasette.hook.call_count"] > 0
+    assert loser_spans == [], (
+        "the never-awaited plugin should produce no aggregate span at all, "
+        "not an undercounted one"
+    )
 
 
 @pytest.mark.asyncio

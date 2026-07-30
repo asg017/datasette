@@ -272,8 +272,23 @@ def _fail_span(span, exception):
     span.set_status(Status(StatusCode.ERROR, str(exception)))
 
 
-async def _await_in_span(span, awaitable):
-    "Await a hookimpl's coroutine with `span` current, then end the span."
+async def _await_in_span(span_name, attributes, awaitable):
+    """
+    Await a hookimpl's coroutine, starting its span only once this coroutine
+    itself actually runs.
+
+    The span is *not* started by the caller before this coroutine is handed
+    back - see the comment in `instrument_hookimpl`. Starting it here instead
+    means a coroutine that is constructed but never awaited (because the
+    dispatch loop that requested it short-circuited on an earlier plugin)
+    never starts a span at all, rather than starting one that then never
+    gets ended.
+    """
+    span = tracer.start_span(span_name, attributes=attributes)
+    if not span.get_span_context().is_valid:
+        # No provider installed, so this is the shared INVALID_SPAN: nothing
+        # to attach, nothing to end.
+        return await awaitable
     try:
         with otel_trace.use_span(
             span,
@@ -307,6 +322,15 @@ def instrument_hookimpl(hook_name, plugin_name, function):
     `await_me_maybe`. So for an awaitable result the coroutine itself is
     wrapped and the span covers the `await`, not the dispatch - otherwise
     every plugin doing I/O, exactly the ones worth measuring, would report 0ms.
+
+    That wrapping coroutine does not start its span until it is actually
+    awaited - see `_await_in_span`. Some dispatch loops stop awaiting once a
+    plugin returns a non-`None` result: `render_cell` breaks out of its loop
+    in `views/table.py`, `views/database.py` and `views/table_extras.py`, so
+    a coroutine returned from here can be discarded rather than awaited.
+    Starting the span eagerly, before that is known, would leave it started
+    and never ended - and an unended span is never exported, silently.
+    Deferring the start means a discarded coroutine starts no span at all.
     """
     function_name = getattr(function, "__name__", repr(function))
     span_name = HOOK + hook_name
@@ -332,28 +356,40 @@ def instrument_hookimpl(hook_name, plugin_name, function):
                 _record_aggregate(bucket, aggregate_key, started, time.time_ns())
                 return result
 
-        span = tracer.start_span(span_name, attributes=attributes)
-        if not span.get_span_context().is_valid:
-            # No provider installed, so this is the shared INVALID_SPAN: there
-            # is nothing to export and nothing worth making current. Skip the
-            # context attach/detach entirely - this is the default path for
-            # anyone running Datasette without OTel configured.
-            return function(*args, **kwargs)
+        # Whether the result is awaitable is not knowable until the function
+        # has been called - the documented Datasette idiom is a *sync*
+        # hookimpl returning an `async def inner()` coroutine, whose body has
+        # not run yet. So the call is timed rather than spanned, and the span
+        # is created from those timestamps once the answer is known:
+        #
+        #   - a plain value or an exception: both timestamps are already in
+        #     hand, so the span is started and ended in the same breath and
+        #     there is no window in which it could be abandoned;
+        #   - an awaitable: span creation is handed to `_await_in_span`,
+        #     which runs only if something actually awaits the coroutine.
+        #
+        # The cost of that is nesting for a *fully synchronous* hookimpl:
+        # a span it creates during its own execution now attaches to the
+        # surrounding span rather than to its dispatch span. No hookimpl in
+        # this codebase does that - the async ones, which are the ones doing
+        # work worth nesting, still run inside their span, in
+        # `_await_in_span`.
+        started = time.time_ns()
         try:
-            with otel_trace.use_span(
-                span,
-                end_on_exit=False,
-                record_exception=False,
-                set_status_on_exception=False,
-            ):
-                result = function(*args, **kwargs)
+            result = function(*args, **kwargs)
         except BaseException as exception:
+            span = tracer.start_span(
+                span_name, start_time=started, attributes=attributes
+            )
+            # Every call here is a no-op on the INVALID_SPAN handed out when
+            # no provider is installed, so that case needs no branch.
             _fail_span(span, exception)
-            span.end()
+            span.end(end_time=time.time_ns())
             raise
         if inspect.isawaitable(result):
-            return _await_in_span(span, result)
-        span.end()
+            return _await_in_span(span_name, attributes, result)
+        span = tracer.start_span(span_name, start_time=started, attributes=attributes)
+        span.end(end_time=time.time_ns())
         return result
 
     wrapper.__datasette_hookimpl_wrapped__ = function
