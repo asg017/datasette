@@ -2440,12 +2440,12 @@ Spans are ``SpanKind.INTERNAL`` unless a kind is listed below. Only ``db.query``
     No attributes.
 
 ``db.write.queue_wait``
-    Time a write spent waiting in its database's write queue before the write thread picked it up. Child of ``db.query``.
+    Time a write spent waiting in its database's write queue before the write thread picked it up. Child of ``db.query`` for a ``block=True`` write, where the caller awaits the write and containment is accurate. For a ``block=False`` write the caller does not await it - the enqueueing request *caused* the write without *containing* it, and the write's spans can outlive the request's own - so this is a root span instead, carrying an OpenTelemetry link back to the enqueueing span rather than a parent. A link records causation without asserting containment, which is exactly the distinction here.
 
     No attributes.
 
 ``db.write.execute``
-    The write executing on the write thread. Child of ``db.query``.
+    The write executing on the write thread. Child of ``db.query`` for a ``block=True`` write; for ``block=False`` a root span with a link back to the enqueueing span instead - see ``db.write.queue_wait`` above.
 
     Attributes:
 
