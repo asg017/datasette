@@ -12,6 +12,7 @@ approximately nothing.
 
 import functools
 import inspect
+import re
 import threading
 import time
 import weakref
@@ -25,6 +26,7 @@ from opentelemetry.trace import Status, StatusCode
 from .telemetry_registry import (
     CODE_FUNCTION,
     DB_NAMESPACE,
+    DB_OPERATION_NAME,
     DB_QUERY_PARAMETER,
     DB_SYSTEM,
     ERROR_TYPE,
@@ -86,6 +88,67 @@ def sql_attribute(sql: str) -> str:
     if len(sql) <= MAX_SQL_LENGTH:
         return sql
     return sql[:MAX_SQL_LENGTH] + "…[truncated]"
+
+
+# db.operation.name is a fixed allowlist rather than "whatever token comes
+# first", on purpose. This runs against arbitrary user-supplied SQL (the
+# `?sql=` query string, canned queries, values typed into the query editor),
+# and this attribute is also a candidate dimension on the db.client.operation
+# .duration metric - see M_OPERATION_DURATION's registry entry. A metric
+# series is keyed by its attribute values, so echoing an arbitrary first word
+# back as an attribute would let one visitor's typo or made-up statement
+# mint a new, permanent metric series. The allowlist bounds that at a fixed,
+# small set of names regardless of what anyone sends.
+#
+# It is deliberately *not* a SQL parser: no comment stripping, no handling of
+# a leading "(" before a UNIONed SELECT, no compound names like "CREATE
+# TABLE". Every one of those is a place a hand-rolled matcher would start
+# accreting special cases and eventually get one wrong - the ticket this
+# implements is explicit that parsing is where this goes wrong, and that
+# omitting a name beats guessing at one. A statement this cannot recognise
+# gets no attribute at all instead of a wrong one.
+DB_OPERATION_ALLOWLIST = frozenset(
+    {
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "CREATE",
+        "DROP",
+        "ALTER",
+        "PRAGMA",
+        "VACUUM",
+        "WITH",
+        "EXPLAIN",
+        "BEGIN",
+        "COMMIT",
+    }
+)
+
+_LEADING_KEYWORD = re.compile(r"^\s*([A-Za-z]+)")
+
+
+def sql_operation_name(sql: str) -> str | None:
+    """
+    The statement's leading keyword, if it is one of a small recognised set.
+
+    Returns None - never a guess - for anything not on the allowlist,
+    including a statement that starts with whitespace-only content, a
+    comment, or punctuation such as the "(" of a parenthesised SELECT. Only
+    safe to call with a single statement: `execute_write_script()` runs
+    several separated by semicolons, so per semantic conventions' guidance on
+    `db.operation.name` ("SHOULD NOT be extracted from db.query.text, when
+    the database system supports query text with multiple operations in
+    non-batch operations") that call site does not use this at all rather
+    than reporting only the first statement's operation.
+    """
+    match = _LEADING_KEYWORD.match(sql)
+    if not match:
+        return None
+    keyword = match.group(1).upper()
+    if keyword in DB_OPERATION_ALLOWLIST:
+        return keyword
+    return None
 
 
 # --- SQL parameter values -------------------------------------------------
@@ -450,12 +513,20 @@ def instrument_plugin_hookimpls(pm, plugin, plugin_name):
 # installed before this module is imported.
 
 
-def _duration_attributes(database_name, operation):
-    return {
+def _duration_attributes(database_name, operation, operation_name=None):
+    attributes = {
         DB_SYSTEM: "sqlite",
         DB_NAMESPACE: database_name,
         OPERATION: operation,
     }
+    if operation_name is not None:
+        # Bounded to DB_OPERATION_ALLOWLIST - see the cardinality note on
+        # M_OPERATION_DURATION in telemetry_registry.py. None (the caller
+        # either has no recognised keyword or, for execute_write_script(),
+        # never asked) leaves the key off entirely rather than recording it
+        # as an empty or sentinel value.
+        attributes[DB_OPERATION_NAME] = operation_name
+    return attributes
 
 
 sql_operation_duration = meter.create_histogram(
@@ -485,16 +556,20 @@ queries_interrupted = meter.create_counter(
 
 
 @contextmanager
-def record_operation_duration(database_name, operation):
+def record_operation_duration(database_name, operation, operation_name=None):
     """
     Record `db.client.operation.duration` for one SQL operation.
 
     `error.type` is set from the exception class on failure, per semconv, so a
     latency distribution can be split by success and failure. For a
     `block=False` write this measures the enqueue, not the write - the same
-    caveat that applies to the surrounding span.
+    caveat that applies to the surrounding span. `operation_name`, when given,
+    is the same allowlisted `db.operation.name` value set on the span - see
+    `sql_operation_name()` above and the cardinality note on
+    `M_OPERATION_DURATION` in telemetry_registry.py for why it is safe here
+    but `db.collection.name` is not.
     """
-    attributes = _duration_attributes(database_name, operation)
+    attributes = _duration_attributes(database_name, operation, operation_name)
     started = time.perf_counter()
     try:
         yield

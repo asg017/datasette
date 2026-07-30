@@ -113,6 +113,29 @@ DB_QUERY_PARAMETER = Attribute(
     ":ref:`setting_trace_sql_parameters` setting is enabled - off by default.",
     optional=True,
 )
+DB_OPERATION_NAME = Attribute(
+    "db.operation.name",
+    "The statement's leading keyword - ``SELECT``, ``INSERT``, ``CREATE``, and "
+    "so on - matched against a small fixed allowlist. Omitted rather than set "
+    "to an arbitrary value: the allowlist exists because this attribute is a "
+    "metric dimension candidate, and echoing an unrecognised first token from "
+    "user-supplied SQL would be an unbounded-cardinality hazard. Also omitted "
+    "for ``execute_write_script()``, which runs multiple statements - per "
+    "semantic conventions, the operation name should not be extracted from "
+    "query text that can contain more than one operation. Note that a "
+    "statement beginning with a CTE reports ``WITH``, not the operation "
+    "inside it - a substantial share of Datasette's own reads, including "
+    "every permission query, take that form. Resolving it further would mean "
+    "parsing.",
+    optional=True,
+)
+DB_COLLECTION_NAME = Attribute(
+    "db.collection.name",
+    "The primary table, set only where the view already knows it - the table "
+    "and row pages. Omitted for arbitrary ``?sql=`` queries, where determining "
+    "the table would mean parsing the query.",
+    optional=True,
+)
 
 PARAM_COUNT = Attribute(
     "datasette.param_count",
@@ -282,6 +305,8 @@ DB_QUERY = SpanName(
         DB_NAMESPACE,
         DB_QUERY_TEXT,
         DB_QUERY_PARAMETER,
+        DB_OPERATION_NAME,
+        DB_COLLECTION_NAME,
         PARAM_COUNT,
         TIME_LIMIT_MS,
         ROWS_RETURNED,
@@ -446,8 +471,16 @@ M_OPERATION_DURATION = MetricName(
     HISTOGRAM,
     "s",
     "Duration of a SQL operation. The standard OpenTelemetry semantic "
-    "convention metric, and the one that survives trace sampling.",
-    (DB_SYSTEM, DB_NAMESPACE, OPERATION, ERROR_TYPE),
+    "convention metric, and the one that survives trace sampling. Carries "
+    "``db.operation.name`` - semantic conventions list it as conditionally "
+    "required on this metric when readily available, and the fixed allowlist "
+    "behind it (see ``db.operation.name`` above) bounds it to a handful of "
+    "series per existing dimension. Deliberately does **not** carry "
+    "``db.collection.name``: unlike the operation name, table names are not "
+    "drawn from a fixed set, and on a public instance where anyone can create "
+    "a table, that dimension has no ceiling - every new table would mint a "
+    "permanent new series alongside the ones already being kept forever.",
+    (DB_SYSTEM, DB_NAMESPACE, OPERATION, DB_OPERATION_NAME, ERROR_TYPE),
     buckets=DURATION_BUCKETS,
 )
 
