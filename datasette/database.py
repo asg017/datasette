@@ -26,6 +26,25 @@ from .telemetry import (
     sql_attribute,
     tracer,
 )
+from .telemetry_registry import (
+    DB_NAMESPACE,
+    DB_QUERY,
+    DB_QUERY_EXECUTE,
+    DB_QUERY_TEXT,
+    DB_SYSTEM,
+    DB_WRITE_EXECUTE,
+    DB_WRITE_QUEUE_WAIT,
+    EXECUTEMANY,
+    EXECUTESCRIPT,
+    INTERRUPTED,
+    ISOLATED_CONNECTION,
+    PARAM_COUNT,
+    ROWS_RETURNED,
+    SQL_ERROR_SUPPRESSED,
+    TIME_LIMIT_MS,
+    TRANSACTION,
+    TRUNCATED,
+)
 from .utils import (
     call_with_supported_arguments,
     detect_fts,
@@ -285,12 +304,12 @@ class Database:
                 cursor, return_all=return_all, returning_limit=returning_limit
             )
 
-        with tracer.start_as_current_span("db.query") as span:
-            span.set_attribute("db.system", "sqlite")
-            span.set_attribute("db.namespace", self.name)
-            span.set_attribute("db.query.text", sql_attribute(sql))
+        with tracer.start_as_current_span(DB_QUERY) as span:
+            span.set_attribute(DB_SYSTEM, "sqlite")
+            span.set_attribute(DB_NAMESPACE, self.name)
+            span.set_attribute(DB_QUERY_TEXT, sql_attribute(sql))
             if params:
-                span.set_attribute("datasette.param_count", len(params))
+                span.set_attribute(PARAM_COUNT, len(params))
                 self._record_parameters(span, params)
             with record_operation_duration(self.name, "write"):
                 results = await self.execute_write_fn(
@@ -304,11 +323,11 @@ class Database:
         def _inner(conn):
             return conn.executescript(sql)
 
-        with tracer.start_as_current_span("db.query") as span:
-            span.set_attribute("db.system", "sqlite")
-            span.set_attribute("db.namespace", self.name)
-            span.set_attribute("db.query.text", sql_attribute(sql))
-            span.set_attribute("datasette.executescript", True)
+        with tracer.start_as_current_span(DB_QUERY) as span:
+            span.set_attribute(DB_SYSTEM, "sqlite")
+            span.set_attribute(DB_NAMESPACE, self.name)
+            span.set_attribute(DB_QUERY_TEXT, sql_attribute(sql))
+            span.set_attribute(EXECUTESCRIPT, True)
             with record_operation_duration(self.name, "write"):
                 results = await self.execute_write_fn(
                     _inner, block=block, transaction=False, request=request
@@ -329,16 +348,16 @@ class Database:
 
             return conn.executemany(sql, count_params(params_seq)), count
 
-        with tracer.start_as_current_span("db.query") as span:
-            span.set_attribute("db.system", "sqlite")
-            span.set_attribute("db.namespace", self.name)
-            span.set_attribute("db.query.text", sql_attribute(sql))
-            span.set_attribute("datasette.executemany", True)
+        with tracer.start_as_current_span(DB_QUERY) as span:
+            span.set_attribute(DB_SYSTEM, "sqlite")
+            span.set_attribute(DB_NAMESPACE, self.name)
+            span.set_attribute(DB_QUERY_TEXT, sql_attribute(sql))
+            span.set_attribute(EXECUTEMANY, True)
             with record_operation_duration(self.name, "write"):
                 results, count = await self.execute_write_fn(
                     _inner, block=block, request=request
                 )
-            span.set_attribute("datasette.rows_returned", count)
+            span.set_attribute(ROWS_RETURNED, count)
         return results
 
     async def execute_isolated_fn(self, fn):
@@ -540,7 +559,7 @@ class Database:
                 # zero time spent constructing/ending the span object here.
                 dequeued_at_ns = time.time_ns()
                 tracer.start_span(
-                    "db.write.queue_wait", start_time=task.enqueued_at_ns
+                    DB_WRITE_QUEUE_WAIT, start_time=task.enqueued_at_ns
                 ).end(end_time=dequeued_at_ns)
                 record_write_queue_wait(self.name, dequeued_at_ns - task.enqueued_at_ns)
                 if conn_exception is not None:
@@ -549,14 +568,12 @@ class Database:
                     exception = conn_exception
                 elif task.isolated_connection:
                     try:
-                        with tracer.start_as_current_span("db.write.execute") as span:
+                        with tracer.start_as_current_span(DB_WRITE_EXECUTE) as span:
                             span.set_attribute(
-                                "datasette.isolated_connection",
+                                ISOLATED_CONNECTION,
                                 task.isolated_connection,
                             )
-                            span.set_attribute(
-                                "datasette.transaction", task.transaction
-                            )
+                            span.set_attribute(TRANSACTION, task.transaction)
                             isolated_connection = self.connect(write=True)
                             try:
                                 result = task.fn(isolated_connection)
@@ -576,14 +593,12 @@ class Database:
                         exception = e
                 else:
                     try:
-                        with tracer.start_as_current_span("db.write.execute") as span:
+                        with tracer.start_as_current_span(DB_WRITE_EXECUTE) as span:
                             span.set_attribute(
-                                "datasette.isolated_connection",
+                                ISOLATED_CONNECTION,
                                 task.isolated_connection,
                             )
-                            span.set_attribute(
-                                "datasette.transaction", task.transaction
-                            )
+                            span.set_attribute(TRANSACTION, task.transaction)
                             if task.transaction:
                                 with conn:
                                     conn.execute("BEGIN IMMEDIATE")
@@ -658,7 +673,7 @@ class Database:
             # db.query span in execute(). Without this, facet suggestion marks
             # two spans per text column as failed on every table page.
             with tracer.start_as_current_span(
-                "db.query.execute",
+                DB_QUERY_EXECUTE,
                 record_exception=log_sql_errors,
                 set_status_on_exception=log_sql_errors,
             ):
@@ -696,23 +711,23 @@ class Database:
         # manager's defaults, so that callers passing log_sql_errors=False can
         # be honoured - see the comment on the generic handler below.
         with tracer.start_as_current_span(
-            "db.query",
+            DB_QUERY,
             record_exception=False,
             set_status_on_exception=False,
         ) as span:
-            span.set_attribute("db.system", "sqlite")
-            span.set_attribute("db.namespace", self.name)
-            span.set_attribute("db.query.text", sql_attribute(sql))
-            span.set_attribute("datasette.time_limit_ms", time_limit_ms)
+            span.set_attribute(DB_SYSTEM, "sqlite")
+            span.set_attribute(DB_NAMESPACE, self.name)
+            span.set_attribute(DB_QUERY_TEXT, sql_attribute(sql))
+            span.set_attribute(TIME_LIMIT_MS, time_limit_ms)
             if params:
-                span.set_attribute("datasette.param_count", len(params))
+                span.set_attribute(PARAM_COUNT, len(params))
                 self._record_parameters(span, params)
             try:
                 with record_operation_duration(self.name, "read"):
                     results = await self.execute_fn(sql_operation_in_thread)
             except QueryInterrupted as e:
                 span.set_status(Status(StatusCode.ERROR, str(e)))
-                span.set_attribute("datasette.interrupted", True)
+                span.set_attribute(INTERRUPTED, True)
                 span.record_exception(e)
                 # A counter rather than only a span, because this is the one
                 # thing an operator wants a rate and an alert on, and spans
@@ -731,10 +746,10 @@ class Database:
                     span.record_exception(e)
                     span.set_status(Status(StatusCode.ERROR, str(e)))
                 else:
-                    span.set_attribute("datasette.sql_error_suppressed", True)
+                    span.set_attribute(SQL_ERROR_SUPPRESSED, True)
                 raise
-            span.set_attribute("datasette.truncated", results.truncated)
-            span.set_attribute("datasette.rows_returned", len(results.rows))
+            span.set_attribute(TRUNCATED, results.truncated)
+            span.set_attribute(ROWS_RETURNED, len(results.rows))
         return results
 
     @property

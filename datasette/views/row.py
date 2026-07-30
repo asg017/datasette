@@ -14,6 +14,7 @@ from datasette.extras import ExtraScope, extra_names_from_request
 from datasette.plugins import pm
 from datasette.resources import TableResource
 from datasette.telemetry import tracer
+from datasette.telemetry_registry import FORMAT, RENDER, ROWS_RETURNED
 from datasette.utils import (
     CustomJSONEncoder,
     CustomRow,
@@ -218,11 +219,9 @@ class RowView(BaseView):
         if format_ in self.ds.renderers:
             # Dispatch request to the correct output format renderer
             # (CSV is not handled here due to streaming)
-            with tracer.start_as_current_span("datasette.render") as span:
-                span.set_attribute("datasette.format", format_)
-                span.set_attribute(
-                    "datasette.rows_returned", len(data.get("rows") or [])
-                )
+            with tracer.start_as_current_span(RENDER) as span:
+                span.set_attribute(FORMAT, format_)
+                span.set_attribute(ROWS_RETURNED, len(data.get("rows") or []))
                 result = call_with_supported_arguments(
                     self.ds.renderers[format_][0],
                     datasette=self.ds,

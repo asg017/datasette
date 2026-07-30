@@ -21,6 +21,7 @@ from datasette.filters import Filters
 from datasette.plugins import pm
 from datasette.resources import DatabaseResource, TableResource
 from datasette.telemetry import tracer
+from datasette.telemetry_registry import FORMAT, RENDER, ROWS_RETURNED
 from datasette.utils import (
     CustomJSONEncoder,
     CustomRow,
@@ -1776,9 +1777,9 @@ async def table_view_traced(datasette, request):
     elif format_ in datasette.renderers:
         # Dispatch request to the correct output format renderer
         # (CSV is not handled here due to streaming)
-        with tracer.start_as_current_span("datasette.render") as span:
-            span.set_attribute("datasette.format", format_)
-            span.set_attribute("datasette.rows_returned", len(rows))
+        with tracer.start_as_current_span(RENDER) as span:
+            span.set_attribute(FORMAT, format_)
+            span.set_attribute(ROWS_RETURNED, len(rows))
             result = call_with_supported_arguments(
                 datasette.renderers[format_][0],
                 datasette=datasette,
