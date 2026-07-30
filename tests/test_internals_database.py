@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import sqlite_utils
+from opentelemetry import context as otel_context_api
 
 from datasette.app import Datasette
 from datasette.database import (
@@ -1223,3 +1224,67 @@ async def test_database_close_is_idempotent(tmpdir):
     # Second call should be a no-op, not raise
     db.close()
     ds._internal_database.close()
+
+
+# --- Ticket 03: context propagation across thread boundaries ---------------
+
+_CONTEXT_LEAK_MARKER_KEY = "otel-ticket3-context-leak-marker"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("num_sql_threads", (0, 1))
+async def test_write_thread_context_is_detached_between_tasks(
+    tmp_path, num_sql_threads
+):
+    """
+    A leaked or wrongly-detached otel context token would silently poison
+    the (persistent, single) write thread for every write processed after
+    it - and a *wrong*-token detach only logs a warning rather than
+    raising, so this can't be caught by "does it raise" alone. It has to
+    be asserted directly.
+
+    This test carries a plain otel context *value* (not a span) through
+    several writes, each queued from underneath its own distinguishing
+    value, then queues one final write with no value present at all. If
+    attach/detach were not correctly paired per task, that last write
+    would observe a leftover marker from whichever earlier task last ran
+    on that thread instead of None.
+    """
+    db_path = tmp_path / "context_leak_test.db"
+    sqlite3.connect(db_path).close()
+    ds = Datasette([str(db_path)], settings={"num_sql_threads": num_sql_threads})
+    db = ds.get_database("context_leak_test")
+    await db.execute_write("create table t (id integer primary key)")
+
+    seen_markers = []
+
+    def probe(conn):
+        seen_markers.append(otel_context_api.get_value(_CONTEXT_LEAK_MARKER_KEY))
+
+    try:
+        for i in range(5):
+            marker = f"marker-{i}"
+            ctx = otel_context_api.set_value(_CONTEXT_LEAK_MARKER_KEY, marker)
+            token = otel_context_api.attach(ctx)
+            try:
+                await db.execute_write_fn(probe)
+            finally:
+                otel_context_api.detach(token)
+
+        # Sanity check: no marker is active in *this* (event loop) context
+        # right now, so the next probe is a fair test of the write
+        # thread's own state rather than something this test forgot to
+        # clean up.
+        assert otel_context_api.get_value(_CONTEXT_LEAK_MARKER_KEY) is None
+        await db.execute_write_fn(probe)
+    finally:
+        db.close()
+
+    assert seen_markers == [
+        "marker-0",
+        "marker-1",
+        "marker-2",
+        "marker-3",
+        "marker-4",
+        None,
+    ]
