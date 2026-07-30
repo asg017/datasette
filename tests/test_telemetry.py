@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import pytest
 
@@ -19,11 +20,9 @@ def _all_attribute_values(otel_spans):
     "Every attribute value across every finished span, for the 'no leaked param values' test."
     values = []
     for span in otel_spans.get_finished_spans():
-        for value in (span.attributes or {}).values():
-            values.append(value)
+        values.extend((span.attributes or {}).values())
         for event in span.events:
-            for value in (event.attributes or {}).values():
-                values.append(value)
+            values.extend((event.attributes or {}).values())
     return values
 
 
@@ -113,3 +112,41 @@ async def test_query_interrupted_sets_error_status(ds_client, otel_spans):
     assert span.attributes["datasette.interrupted"] is True
     assert span.events
     assert all(event.name == "exception" for event in span.events)
+
+
+@pytest.mark.asyncio
+async def test_sql_error_sets_error_status_by_default(ds_client, otel_spans):
+    db = ds_client.ds.get_database("fixtures")
+    with pytest.raises(sqlite3.OperationalError):
+        await db.execute("select this_is_not_valid_sql from nowhere")
+
+    spans = _db_query_spans(otel_spans)
+    assert spans
+    span = spans[-1]
+    assert span.status.status_code == StatusCode.ERROR
+    assert any(event.name == "exception" for event in span.events)
+
+
+@pytest.mark.asyncio
+async def test_suppressed_sql_error_is_not_a_span_error(ds_client, otel_spans):
+    """
+    log_sql_errors=False means the caller is probing and expects failures.
+
+    Facet suggestion runs `json_type(column)` against every column precisely
+    to discover which ones raise, so marking those spans as errors would put
+    two red spans per text column on every table page - burying real failures
+    and tripping any alerting keyed on span status.
+    """
+    db = ds_client.ds.get_database("fixtures")
+    with pytest.raises(sqlite3.OperationalError):
+        await db.execute(
+            "select json_type(content) from simple_primary_key where content != ''",
+            log_sql_errors=False,
+        )
+
+    spans = _db_query_spans(otel_spans)
+    assert spans
+    span = spans[-1]
+    assert span.status.status_code == StatusCode.UNSET
+    assert span.attributes["datasette.sql_error_suppressed"] is True
+    assert not [event for event in span.events if event.name == "exception"]

@@ -576,7 +576,14 @@ class Database:
             else:
                 return Results(rows, False, cursor.description)
 
-        with tracer.start_as_current_span("db.query") as span:
+        # Exception handling is explicit rather than left to the context
+        # manager's defaults, so that callers passing log_sql_errors=False can
+        # be honoured - see the comment on the generic handler below.
+        with tracer.start_as_current_span(
+            "db.query",
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
             span.set_attribute("db.system", "sqlite")
             span.set_attribute("db.namespace", self.name)
             span.set_attribute("db.query.text", sql_attribute(sql))
@@ -589,6 +596,20 @@ class Database:
                 span.set_status(Status(StatusCode.ERROR, str(e)))
                 span.set_attribute("datasette.interrupted", True)
                 span.record_exception(e)
+                raise
+            except Exception as e:
+                # log_sql_errors=False means the caller is probing and treats
+                # failure as an expected answer, not an error. Facet
+                # suggestion is the big one: it runs json_type() against every
+                # column precisely to find out which ones raise, so a table
+                # with N text columns would otherwise mark N queries per page
+                # as failed - burying real errors and setting off any
+                # alerting based on span status.
+                if log_sql_errors:
+                    span.record_exception(e)
+                    span.set_status(Status(StatusCode.ERROR, str(e)))
+                else:
+                    span.set_attribute("datasette.sql_error_suppressed", True)
                 raise
             span.set_attribute("datasette.truncated", results.truncated)
             span.set_attribute("datasette.rows_returned", len(results.rows))
