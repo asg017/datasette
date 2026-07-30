@@ -49,7 +49,7 @@ from .events import Event
 from .plugins import DEFAULT_PLUGINS, get_plugins, pm
 from .renderer import json_renderer
 from .resources import DatabaseResource, TableResource
-from .telemetry import aggregate_hook_spans
+from .telemetry import aggregate_hook_spans, tracer
 from .tokens import TokenInvalid
 from .url_builder import Urls
 from .utils import (
@@ -1718,14 +1718,31 @@ class Datasette:
         """
         from datasette.utils.actions_sql import build_allowed_resources_sql
 
-        action_obj = self.actions.get(action)
-        if not action_obj:
-            raise ValueError(f"Unknown action: {action}")
+        # Attributes knowable up front, so they can be set at span start
+        # rather than patched on afterwards. Never include an actor
+        # identifier here - only whether one was present.
+        span_attributes = {
+            "datasette.action": action,
+            "datasette.actor_present": actor is not None,
+        }
+        if parent is not None:
+            span_attributes["datasette.resource"] = parent
 
-        sql, params = await build_allowed_resources_sql(
-            self, actor, action, parent=parent, include_is_private=include_is_private
-        )
-        return ResourcesSQL(sql, params)
+        with tracer.start_as_current_span(
+            "datasette.permission_resources_sql", attributes=span_attributes
+        ):
+            action_obj = self.actions.get(action)
+            if not action_obj:
+                raise ValueError(f"Unknown action: {action}")
+
+            sql, params = await build_allowed_resources_sql(
+                self,
+                actor,
+                action,
+                parent=parent,
+                include_is_private=include_is_private,
+            )
+            return ResourcesSQL(sql, params)
 
     async def allowed_resources(
         self,
@@ -1783,95 +1800,112 @@ class Datasette:
                 print(table.child)
         """
 
-        action_obj = self.actions.get(action)
-        if not action_obj:
-            raise ValueError(f"Unknown action: {action}")
+        # Attributes knowable up front, so they can be set at span start
+        # rather than patched on afterwards. Never include an actor
+        # identifier here - only whether one was present.
+        span_attributes = {
+            "datasette.action": action,
+            "datasette.actor_present": actor is not None,
+        }
+        if parent is not None:
+            span_attributes["datasette.resource"] = parent
 
-        # Validate and cap limit
-        limit = min(max(1, limit), 1000)
+        with tracer.start_as_current_span(
+            "datasette.allowed_resources", attributes=span_attributes
+        ) as span:
+            action_obj = self.actions.get(action)
+            if not action_obj:
+                raise ValueError(f"Unknown action: {action}")
 
-        # Get base SQL query
-        query, params = await self.allowed_resources_sql(
-            action=action,
-            actor=actor,
-            parent=parent,
-            include_is_private=include_is_private,
-        )
+            # Validate and cap limit
+            limit = min(max(1, limit), 1000)
 
-        # Add keyset pagination WHERE clause if next token provided
-        if next:
-            try:
-                components = urlsafe_components(next)
-                if len(components) >= 2:
-                    last_parent, last_child = components[0], components[1]
-                    # Keyset condition: (parent > last) OR (parent = last AND child > last)
-                    keyset_where = """
-                        (parent > :keyset_parent OR
-                         (parent = :keyset_parent AND child > :keyset_child))
-                    """
-                    # Wrap original query and add keyset filter
-                    query = f"SELECT * FROM ({query}) WHERE {keyset_where}"
-                    params["keyset_parent"] = last_parent
-                    params["keyset_child"] = last_child
-            except (ValueError, KeyError):
-                # Invalid token - ignore and start from beginning
-                pass
+            # Get base SQL query
+            query, params = await self.allowed_resources_sql(
+                action=action,
+                actor=actor,
+                parent=parent,
+                include_is_private=include_is_private,
+            )
 
-        # Add LIMIT (fetch limit+1 to detect if there are more results)
-        # Note: query from allowed_resources_sql() already includes ORDER BY parent, child
-        query = f"{query} LIMIT :limit"
-        params["limit"] = limit + 1
-
-        # Execute query
-        result = await self.get_internal_database().execute(query, params)
-        rows = list(result.rows)
-
-        # Check if truncated (got more than limit rows)
-        truncated = len(rows) > limit
-        if truncated:
-            rows = rows[:limit]  # Remove the extra row
-
-        # Build Resource objects with optional attributes
-        resources = []
-        for row in rows:
-            # row[0]=parent, row[1]=child, row[2]=reason, row[3]=is_private (if requested)
-            resource = self.resource_for_action(action, parent=row[0], child=row[1])
-
-            # Add reasons if requested
-            if include_reasons:
-                reason_json = row[2]
+            # Add keyset pagination WHERE clause if next token provided
+            if next:
                 try:
-                    reasons_array = (
-                        json.loads(reason_json) if isinstance(reason_json, str) else []
-                    )
-                    resource.reasons = [r for r in reasons_array if r is not None]
-                except (json.JSONDecodeError, TypeError):
-                    resource.reasons = [reason_json] if reason_json else []
+                    components = urlsafe_components(next)
+                    if len(components) >= 2:
+                        last_parent, last_child = components[0], components[1]
+                        # Keyset condition: (parent > last) OR (parent = last AND child > last)
+                        keyset_where = """
+                            (parent > :keyset_parent OR
+                             (parent = :keyset_parent AND child > :keyset_child))
+                        """
+                        # Wrap original query and add keyset filter
+                        query = f"SELECT * FROM ({query}) WHERE {keyset_where}"
+                        params["keyset_parent"] = last_parent
+                        params["keyset_child"] = last_child
+                except (ValueError, KeyError):
+                    # Invalid token - ignore and start from beginning
+                    pass
 
-            # Add private flag if requested
-            if include_is_private:
-                resource.private = bool(row[3])
+            # Add LIMIT (fetch limit+1 to detect if there are more results)
+            # Note: query from allowed_resources_sql() already includes ORDER BY parent, child
+            query = f"{query} LIMIT :limit"
+            params["limit"] = limit + 1
 
-            resources.append(resource)
+            # Execute query
+            result = await self.get_internal_database().execute(query, params)
+            rows = list(result.rows)
 
-        # Generate next token if there are more results
-        next_token = None
-        if truncated and resources:
-            last_resource = resources[-1]
-            # Use tilde-encoding like table pagination
-            next_token = f"{tilde_encode(str(last_resource.parent))},{tilde_encode(str(last_resource.child))}"
+            # Check if truncated (got more than limit rows)
+            truncated = len(rows) > limit
+            if truncated:
+                rows = rows[:limit]  # Remove the extra row
 
-        return PaginatedResources(
-            resources=resources,
-            next=next_token,
-            _datasette=self,
-            _action=action,
-            _actor=actor,
-            _parent=parent,
-            _include_is_private=include_is_private,
-            _include_reasons=include_reasons,
-            _limit=limit,
-        )
+            # Build Resource objects with optional attributes
+            resources = []
+            for row in rows:
+                # row[0]=parent, row[1]=child, row[2]=reason, row[3]=is_private (if requested)
+                resource = self.resource_for_action(action, parent=row[0], child=row[1])
+
+                # Add reasons if requested
+                if include_reasons:
+                    reason_json = row[2]
+                    try:
+                        reasons_array = (
+                            json.loads(reason_json)
+                            if isinstance(reason_json, str)
+                            else []
+                        )
+                        resource.reasons = [r for r in reasons_array if r is not None]
+                    except (json.JSONDecodeError, TypeError):
+                        resource.reasons = [reason_json] if reason_json else []
+
+                # Add private flag if requested
+                if include_is_private:
+                    resource.private = bool(row[3])
+
+                resources.append(resource)
+
+            # Generate next token if there are more results
+            next_token = None
+            if truncated and resources:
+                last_resource = resources[-1]
+                # Use tilde-encoding like table pagination
+                next_token = f"{tilde_encode(str(last_resource.parent))},{tilde_encode(str(last_resource.child))}"
+
+            span.set_attribute("datasette.resources_returned", len(resources))
+
+            return PaginatedResources(
+                resources=resources,
+                next=next_token,
+                _datasette=self,
+                _action=action,
+                _actor=actor,
+                _parent=parent,
+                _include_is_private=include_is_private,
+                _include_reasons=include_reasons,
+                _limit=limit,
+            )
 
     async def allowed(
         self,
@@ -1939,84 +1973,110 @@ class Datasette:
         parent = resource.parent if resource else None
         child = resource.child if resource else None
 
-        # Expand also_requires dependencies (transitively) so that each
-        # dependency is resolved within the same batch
-        expanded = []
-
-        def add_action(name):
-            if name in expanded:
-                return
-            action_obj = self.actions.get(name)
-            if action_obj is None:
-                raise ValueError(f"Unknown action: {name}")
-            expanded.append(name)
-            if action_obj.also_requires:
-                add_action(action_obj.also_requires)
-
         requested = list(dict.fromkeys(actions))
-        for name in requested:
-            add_action(name)
 
-        # Consult the request-scoped cache, unless permission checks are
-        # being skipped (skip-mode verdicts must never be cached)
-        skip = _skip_permission_checks.get()
-        cache = None if skip else _permission_check_cache.get()
-
-        final = {}
-        to_check = []
-        for name in expanded:
-            if cache is not None:
-                key = _permission_cache_key(actor, name, parent, child)
-                if key in cache:
-                    final[name] = cache[key]
-                    continue
-            to_check.append(name)
-
-        raw = {}
-        if to_check:
-            raw = await check_permissions_for_actions(
-                datasette=self,
-                actor=actor,
-                actions=to_check,
-                parent=parent,
-                child=child,
+        # Attributes knowable up front, so they can be set at span start
+        # rather than patched on afterwards. Never include an actor
+        # identifier here - only whether one was present.
+        span_attributes = {"datasette.actor_present": actor is not None}
+        if len(requested) == 1:
+            span_attributes["datasette.action"] = requested[0]
+        else:
+            span_attributes["datasette.actions"] = tuple(requested)
+        if resource is not None:
+            span_attributes["datasette.resource"] = (
+                parent if child is None else f"{parent}/{child}"
             )
 
-        def resolve(name):
-            # final verdict = own rules AND verdict of also_requires chain
-            if name in final:
-                return final[name]
-            result = raw[name]
-            action_obj = self.actions.get(name)
-            if result and action_obj.also_requires:
-                result = resolve(action_obj.also_requires)
-            final[name] = result
-            return result
+        with tracer.start_as_current_span(
+            "datasette.permission_check", attributes=span_attributes
+        ) as span:
+            # Expand also_requires dependencies (transitively) so that each
+            # dependency is resolved within the same batch
+            expanded = []
 
-        for name in expanded:
-            resolve(name)
+            def add_action(name):
+                if name in expanded:
+                    return
+                action_obj = self.actions.get(name)
+                if action_obj is None:
+                    raise ValueError(f"Unknown action: {name}")
+                expanded.append(name)
+                if action_obj.also_requires:
+                    add_action(action_obj.also_requires)
 
-        # Cache the freshly computed checks
-        if cache is not None:
-            for name in to_check:
-                cache[_permission_cache_key(actor, name, parent, child)] = final[name]
+            for name in requested:
+                add_action(name)
 
-        # Log every check (including cache hits) for the debug page,
-        # dependencies before the actions that required them
-        when = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        for name in reversed(expanded):
-            self._permission_checks.append(
-                PermissionCheck(
-                    when=when,
+            # Consult the request-scoped cache, unless permission checks are
+            # being skipped (skip-mode verdicts must never be cached)
+            skip = _skip_permission_checks.get()
+            cache = None if skip else _permission_check_cache.get()
+
+            final = {}
+            to_check = []
+            for name in expanded:
+                if cache is not None:
+                    key = _permission_cache_key(actor, name, parent, child)
+                    if key in cache:
+                        final[name] = cache[key]
+                        continue
+                to_check.append(name)
+
+            raw = {}
+            if to_check:
+                raw = await check_permissions_for_actions(
+                    datasette=self,
                     actor=actor,
-                    action=name,
+                    actions=to_check,
                     parent=parent,
                     child=child,
-                    result=final[name],
                 )
-            )
 
-        return {name: final[name] for name in requested}
+            def resolve(name):
+                # final verdict = own rules AND verdict of also_requires chain
+                if name in final:
+                    return final[name]
+                result = raw[name]
+                action_obj = self.actions.get(name)
+                if result and action_obj.also_requires:
+                    result = resolve(action_obj.also_requires)
+                final[name] = result
+                return result
+
+            for name in expanded:
+                resolve(name)
+
+            # Cache the freshly computed checks
+            if cache is not None:
+                for name in to_check:
+                    cache[_permission_cache_key(actor, name, parent, child)] = final[
+                        name
+                    ]
+
+            # Log every check (including cache hits) for the debug page,
+            # dependencies before the actions that required them
+            when = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            for name in reversed(expanded):
+                self._permission_checks.append(
+                    PermissionCheck(
+                        when=when,
+                        actor=actor,
+                        action=name,
+                        parent=parent,
+                        child=child,
+                        result=final[name],
+                    )
+                )
+
+            # Not known until here: whether every check was served from the
+            # cache (the N+1 signal) and, for single-action calls, the
+            # verdict itself.
+            span.set_attribute("datasette.permission.cached", not to_check)
+            if len(requested) == 1:
+                span.set_attribute("datasette.result", final[requested[0]])
+
+            return {name: final[name] for name in requested}
 
     async def ensure_permission(
         self,
