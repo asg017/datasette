@@ -8,6 +8,7 @@ from pprint import pprint
 import pluggy
 
 from . import hookspecs
+from .telemetry import instrument_plugin_hookimpls
 
 DEFAULT_PLUGINS = (
     "datasette.publish.heroku",
@@ -32,7 +33,25 @@ DEFAULT_PLUGINS = (
     "datasette.events",
 )
 
-pm = pluggy.PluginManager("datasette")
+
+class DatasettePluginManager(pluggy.PluginManager):
+    """
+    A pluggy PluginManager that instruments each registered hookimpl with an
+    OpenTelemetry span, so plugin hook dispatch is attributable per-plugin.
+
+    Wrapping happens here, at registration, rather than through pluggy's
+    `add_hookcall_monitoring`: that hook only sees the synchronous multicall,
+    which for an `async def` hookimpl returns a coroutine in ~0ms and would
+    therefore report ~0ms for every plugin that actually does I/O.
+    """
+
+    def register(self, plugin, name=None):
+        plugin_name = super().register(plugin, name)
+        instrument_plugin_hookimpls(self, plugin, plugin_name)
+        return plugin_name
+
+
+pm = DatasettePluginManager("datasette")
 pm.add_hookspecs(hookspecs)
 
 DATASETTE_TRACE_PLUGINS = os.environ.get("DATASETTE_TRACE_PLUGINS", None)

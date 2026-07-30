@@ -49,6 +49,7 @@ from .events import Event
 from .plugins import DEFAULT_PLUGINS, get_plugins, pm
 from .renderer import json_renderer
 from .resources import DatabaseResource, TableResource
+from .telemetry import aggregate_hook_spans
 from .tokens import TokenInvalid
 from .url_builder import Urls
 from .utils import (
@@ -2837,7 +2838,11 @@ class DatasetteRouter:
 
         cache_token = _permission_check_cache.set({})
         try:
-            return await self.route_path(scope, receive, send, path)
+            # Per-cell hooks such as render_cell are dispatched hundreds of
+            # times per page; inside this window they accumulate into one
+            # aggregate span each instead of one span per dispatch
+            with aggregate_hook_spans():
+                return await self.route_path(scope, receive, send, path)
         finally:
             _permission_check_cache.reset(cache_token)
 
