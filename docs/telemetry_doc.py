@@ -37,6 +37,9 @@ def metrics(cog):
     for metric in METRICS:
         cog.out(f"``{metric}``\n")
         cog.out(f"    {metric.kind}, unit ``{metric.unit}``. {metric.description}\n\n")
+        if metric.buckets:
+            boundaries = ", ".join(f"``{boundary}``" for boundary in metric.buckets)
+            cog.out(f"    Bucket boundaries: {boundaries}.\n\n")
         if metric.attributes:
             cog.out("    Attributes:\n\n")
             for attribute in metric.attributes:
