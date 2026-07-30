@@ -284,6 +284,76 @@ async def test_metrics_are_reported_through_the_sdk_for_gauges(otel_metrics):
         ds.close()
 
 
+HISTOGRAM_PROBES = [
+    # (instrument attribute on telemetry, metric name, isolating attributes)
+    (
+        "sql_operation_duration",
+        "db.client.operation.duration",
+        {"db.namespace": "bucket_probe_operation"},
+    ),
+    (
+        "write_queue_wait",
+        "datasette.write.queue_wait",
+        {"db.namespace": "bucket_probe_queue_wait"},
+    ),
+    (
+        "template_render_duration",
+        "datasette.template.render.duration",
+        {"datasette.template": "bucket_probe.html"},
+    ),
+    ("facet_duration", "datasette.facet.duration", {"datasette.facet_type": "probe"}),
+]
+
+# One value inside each of six distinct registry buckets. Under OpenTelemetry's
+# default boundaries - [0, 5, 10, 25, ...], meant for milliseconds - the first
+# five of these all land in (0, 5] and only 7.0 lands elsewhere, so the
+# "occupies six buckets" assertion below fails if the advisory is ever dropped.
+SPREAD = [0.00005, 0.0003, 0.002, 0.03, 0.8, 7.0]
+
+
+@pytest.mark.parametrize(
+    "instrument_name,metric_name,attributes",
+    HISTOGRAM_PROBES,
+    ids=[metric for _, metric, _ in HISTOGRAM_PROBES],
+)
+def test_histograms_spread_values_across_buckets(
+    otel_metrics, instrument_name, metric_name, attributes
+):
+    """
+    The registry's boundaries reach the SDK, and a realistic spread of
+    seconds-scale durations occupies more than one bucket.
+
+    Recording onto the instrument directly rather than driving a workload is
+    deliberate: real durations here are all tens of microseconds and would
+    share a bucket no matter what the boundaries were, which is exactly the
+    situation this test exists to detect.
+
+    `explicit_bounds` is compared against the registry rather than against the
+    instrument's own configuration - the instrument is built *from* the
+    registry, so that comparison would be a value against itself. What is
+    checked here is that the advisory survived the trip through the SDK.
+    """
+    from datasette.telemetry_registry import METRICS
+
+    metric = next(m for m in METRICS if m == metric_name)
+    instrument = getattr(telemetry, instrument_name)
+    for value in SPREAD:
+        instrument.record(value, attributes)
+
+    otel_metrics.collect()
+    point = otel_metrics.point(metric_name, attributes)
+
+    assert (
+        tuple(point.explicit_bounds) == metric.buckets
+    ), "the registry's boundaries did not reach the SDK"
+    assert point.count == len(SPREAD)
+    occupied = [count for count in point.bucket_counts if count]
+    assert len(occupied) == len(SPREAD), (
+        f"expected each of {SPREAD} in its own bucket, got bucket counts "
+        f"{list(point.bucket_counts)} for bounds {list(point.explicit_bounds)}"
+    )
+
+
 def test_closed_datasette_stops_being_observed():
     ds = Datasette(memory=True)
     ds.add_memory_database("closed_db")

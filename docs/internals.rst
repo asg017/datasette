@@ -2536,6 +2536,8 @@ All metric names use the ``datasette.*`` prefix except ``db.client.operation.dur
 
 The gauges are `observable <https://opentelemetry.io/docs/specs/otel/metrics/api/#asynchronous-gauge>`__: Datasette computes them only when something is collecting, so an instance with no metrics provider installed does no work for them at all.
 
+The histograms are all in seconds, and each declares its own bucket boundaries - listed below - because OpenTelemetry's defaults are tuned for milliseconds and would put every SQLite query, template render and facet into a single bucket. The boundaries are the semantic conventions' recommended set for ``db.client.operation.duration`` plus ``0.0001`` and ``0.0005`` at the bottom, since SQLite runs in-process and many real queries take tens of microseconds. They are advisory: an SDK `view <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#view>`__ configured by whoever runs Datasette overrides them.
+
 .. [[[cog
     from telemetry_doc import metrics
     metrics(cog)
@@ -2543,6 +2545,8 @@ The gauges are `observable <https://opentelemetry.io/docs/specs/otel/metrics/api
 
 ``db.client.operation.duration``
     Histogram, unit ``s``. Duration of a SQL operation. The standard OpenTelemetry semantic convention metric, and the one that survives trace sampling.
+
+    Bucket boundaries: ``0.0001``, ``0.0005``, ``0.001``, ``0.005``, ``0.01``, ``0.05``, ``0.1``, ``0.5``, ``1``, ``5``, ``10``.
 
     Attributes:
 
@@ -2553,6 +2557,8 @@ The gauges are `observable <https://opentelemetry.io/docs/specs/otel/metrics/api
 
 ``datasette.write.queue_wait``
     Histogram, unit ``s``. Time each write waited in its database's write queue. The metric counterpart of the ``db.write.queue_wait`` span.
+
+    Bucket boundaries: ``0.0001``, ``0.0005``, ``0.001``, ``0.005``, ``0.01``, ``0.05``, ``0.1``, ``0.5``, ``1``, ``5``, ``10``.
 
     Attributes:
 
@@ -2595,12 +2601,16 @@ The gauges are `observable <https://opentelemetry.io/docs/specs/otel/metrics/api
 ``datasette.template.render.duration``
     Histogram, unit ``s``. Time spent rendering templates. Template names are bounded by the templates that exist, so this is safe to break down by. Note that a template rendering a slot nests, so the inner render is counted twice.
 
+    Bucket boundaries: ``0.0001``, ``0.0005``, ``0.001``, ``0.005``, ``0.01``, ``0.05``, ``0.1``, ``0.5``, ``1``, ``5``, ``10``.
+
     Attributes:
 
     - ``datasette.template``
 
 ``datasette.facet.duration``
     Histogram, unit ``s``. Time spent on one facet. Suggestion and calculation have very different costs and are worth separating.
+
+    Bucket boundaries: ``0.0001``, ``0.0005``, ``0.001``, ``0.005``, ``0.01``, ``0.05``, ``0.1``, ``0.5``, ``1``, ``5``, ``10``.
 
     Attributes:
 

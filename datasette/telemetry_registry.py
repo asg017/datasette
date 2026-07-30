@@ -63,14 +63,19 @@ class SpanName(str):
 class MetricName(str):
     "A metric name, carrying its instrument kind, unit and attributes."
 
-    __slots__ = ("attributes", "description", "kind", "unit")
+    __slots__ = ("attributes", "buckets", "description", "kind", "unit")
 
-    def __new__(cls, name, kind, unit, description, attributes=()):
+    def __new__(cls, name, kind, unit, description, attributes=(), buckets=None):
         self = super().__new__(cls, name)
         self.kind = kind
         self.unit = unit
         self.description = description
         self.attributes = tuple(attributes)
+        # Explicit histogram bucket boundaries, for histograms only. Passed to
+        # create_histogram() as explicit_bucket_boundaries_advisory and
+        # published in the generated docs, since an operator writing a
+        # histogram_quantile() query needs to know them.
+        self.buckets = tuple(buckets) if buckets is not None else None
         return self
 
     def __repr__(self):
@@ -387,6 +392,25 @@ SPANS = (
 
 # --- Metrics --------------------------------------------------------------
 
+# Every duration histogram here is in seconds, and OpenTelemetry's default
+# bucket boundaries are tuned for milliseconds - their first non-zero boundary
+# is 5, so without explicit boundaries every SQLite query, template render and
+# facet lands in the single (0, 5] second bucket and every quantile query
+# returns noise.
+#
+# These are the OpenTelemetry semantic conventions' recommended boundaries for
+# db.client.operation.duration, in seconds, plus 0.0001 and 0.0005 at the
+# bottom. The deviation is deliberate: those boundaries assume a network
+# database client, whereas SQLite is in-process and a large fraction of real
+# queries run in 30-80us, which would otherwise all pile into the first
+# bucket and be indistinguishable from each other.
+#
+# One shared list is used for all four histograms rather than a tailored list
+# each, so that dashboards stay comparable and a queue wait can be read
+# against the query duration it delays. It already spans 100us to 10s, which
+# covers both a fast in-process read and a write queued behind contention.
+DURATION_BUCKETS = (0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10)
+
 M_OPERATION_DURATION = MetricName(
     "db.client.operation.duration",
     HISTOGRAM,
@@ -394,6 +418,7 @@ M_OPERATION_DURATION = MetricName(
     "Duration of a SQL operation. The standard OpenTelemetry semantic "
     "convention metric, and the one that survives trace sampling.",
     (DB_SYSTEM, DB_NAMESPACE, OPERATION, ERROR_TYPE),
+    buckets=DURATION_BUCKETS,
 )
 
 M_WRITE_QUEUE_WAIT = MetricName(
@@ -403,6 +428,7 @@ M_WRITE_QUEUE_WAIT = MetricName(
     "Time each write waited in its database's write queue. The metric "
     "counterpart of the ``db.write.queue_wait`` span.",
     (DB_NAMESPACE,),
+    buckets=DURATION_BUCKETS,
 )
 
 M_QUERIES_INTERRUPTED = MetricName(
@@ -469,6 +495,7 @@ M_TEMPLATE_RENDER_DURATION = MetricName(
     "templates that exist, so this is safe to break down by. Note that a "
     "template rendering a slot nests, so the inner render is counted twice.",
     (TEMPLATE,),
+    buckets=DURATION_BUCKETS,
 )
 
 M_FACET_DURATION = MetricName(
@@ -478,6 +505,7 @@ M_FACET_DURATION = MetricName(
     "Time spent on one facet. Suggestion and calculation have very different "
     "costs and are worth separating.",
     (FACET_TYPE, FACET_PHASE),
+    buckets=DURATION_BUCKETS,
 )
 
 M_FACETS_TIMED_OUT = MetricName(

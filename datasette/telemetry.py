@@ -403,6 +403,7 @@ sql_operation_duration = meter.create_histogram(
     M_OPERATION_DURATION,
     unit=M_OPERATION_DURATION.unit,
     description="Duration of a SQL operation issued by Datasette",
+    explicit_bucket_boundaries_advisory=M_OPERATION_DURATION.buckets,
 )
 
 write_queue_wait = meter.create_histogram(
@@ -411,6 +412,7 @@ write_queue_wait = meter.create_histogram(
     description=(
         "Time a write spent queued behind the single write thread for its database"
     ),
+    explicit_bucket_boundaries_advisory=M_WRITE_QUEUE_WAIT.buckets,
 )
 
 queries_interrupted = meter.create_counter(
@@ -620,12 +622,14 @@ template_render_duration = meter.create_histogram(
     M_TEMPLATE_RENDER_DURATION,
     unit=M_TEMPLATE_RENDER_DURATION.unit,
     description="Time spent rendering a Jinja template into a response",
+    explicit_bucket_boundaries_advisory=M_TEMPLATE_RENDER_DURATION.buckets,
 )
 
 facet_duration = meter.create_histogram(
     M_FACET_DURATION,
     unit=M_FACET_DURATION.unit,
     description="Time spent calculating or suggesting one facet",
+    explicit_bucket_boundaries_advisory=M_FACET_DURATION.buckets,
 )
 
 facets_timed_out = meter.create_counter(
