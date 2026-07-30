@@ -1,16 +1,18 @@
 # OpenTelemetry demo
 
-Datasette core depends on `opentelemetry-api` only. It emits spans and nothing else — it never
-creates a `TracerProvider`, never configures an exporter, and never sets a sampler. With no SDK
-installed every span is a no-op and costs approximately nothing.
+Datasette core depends on `opentelemetry-api` only. It emits spans and metrics and nothing else — it
+never creates a `TracerProvider` or a `MeterProvider`, never configures an exporter, and never sets a
+sampler. With no SDK installed every span and every instrument is a no-op and costs approximately
+nothing.
 
-That means "turning tracing on" is entirely the job of whoever runs Datasette. This directory shows
+That means "turning telemetry on" is entirely the job of whoever runs Datasette. This directory shows
 several ways to do it, **none of which needs Docker** — including a real OTLP export over the wire,
 and Jaeger driven from its own binary.
 
 | | |
 |---|---|
 | `trace_demo.py` | Self-contained span waterfall. No network, no agent |
+| `metrics_demo.py` | Saturates the SQL thread pool and prints the gauges |
 | `otlp_receiver.py` | A ~120 line OTLP/HTTP receiver, to verify a real export |
 | `plugins/otel_asgi.py` | Gives each request a root span — needed for any trace UI |
 
@@ -74,7 +76,50 @@ Writes are not exercised here because this is a read-only page. Hitting a write 
 `db.write.queue_wait` and `db.write.execute` spans as children of `db.query`, which is how you tell
 "the write was slow" apart from "the write waited 490ms behind another writer".
 
-## 2. Real Datasette, spans on your terminal
+## 2. The question spans cannot answer
+
+```bash
+uv run python demos/otel/metrics_demo.py
+```
+
+A trace tells you a query took 170ms. It does not tell you that 130ms of that was spent waiting for
+one of only three threads — "how many threads are busy right now" is a level, not an event, so no
+span can carry it. That is what metrics are for.
+
+The script registers a SQL function that sleeps, fires 12 concurrent 40ms queries at a pool of 3
+threads, and samples the gauges while they are in flight. Real output:
+
+```
+num_sql_threads = 3, firing 12 concurrent 40ms queries
+
+wall clock                     : 170ms
+  if fully serialised          : 480ms
+  with 3 threads perfectly used : 160ms
+
+Peak values sampled while the queries were in flight:
+
+  datasette.sql.queries.pending  {db.namespace=demo} = 12
+  datasette.sql.threads.queue_depth = 9
+
+Final collection:
+
+  datasette.sql.threads.limit
+      3
+  db.client.operation.duration  {datasette.operation=read, db.namespace=demo, db.system=sqlite}
+      count=16 sum=1.2605s min=0.0001s max=0.1695s
+  datasette.write.queue_wait  {db.namespace=demo}
+      count=1 sum=0.0002s min=0.0002s max=0.0002s
+```
+
+`queue_depth = 9` is the whole point: 12 queries, 3 threads, 9 of them sitting in a queue. Sustained
+above zero in production means requests are backing up on `num_sql_threads`, and no amount of
+reading traces would have told you that.
+
+Note also `max=0.1695s` on the duration histogram against a query whose actual work is 40ms. The
+gap is queue time. The two numbers together — 170ms observed, 40ms of work — are what distinguishes
+"my queries are slow" from "my pool is too small".
+
+## 3. Real Datasette, spans on your terminal
 
 This is the replacement for the removed `?_trace=1`:
 
@@ -94,7 +139,7 @@ Two things that will otherwise look like bugs:
   auto-configuration, which only runs under the agent — and core never installs a provider itself.
 - **Output is not instant.** The default `BatchSpanProcessor` flushes roughly every 10 seconds.
 
-## 3. A real OTLP export, still with no Docker
+## 4. A real OTLP export, still with no Docker
 
 The console exporter proves spans exist, but not that they survive a real export. `otlp_receiver.py`
 is a ~120 line OTLP/HTTP receiver that closes that gap — real protobuf, over the wire, no collector
@@ -148,7 +193,7 @@ between "the write was slow" and "the write waited behind another writer".
 The receiver is a debugging aid, not a backend: nothing is persisted, it speaks OTLP/HTTP only (not
 gRPC), and it ignores metrics and logs.
 
-## 4. Jaeger, with the binary rather than Docker
+## 5. Jaeger, with the binary rather than Docker
 
 Jaeger ingests OTLP directly, so nothing extra is needed between it and Datasette. Assuming the
 Jaeger binary is on your PATH:
@@ -235,7 +280,7 @@ Without `plugins/otel_asgi.py` everything still gets traced, but every span is a
 on one request: **75 root spans without it, 1 with it** (plus the startup spans above). A trace UI is
 close to unusable in the first case.
 
-## 5. Sending it to a real backend
+## 6. Sending it to a real backend
 
 Any OTLP-compatible backend works through the same agent — Datasette needs no configuration of its
 own. Point the endpoint at your collector instead of the demo receiver:
@@ -272,6 +317,24 @@ error details: unknown service opentelemetry.proto.collector.metrics.v1.MetricsS
 Tracing still works throughout — it is the metrics pipeline failing, not yours — but the noise
 buries anything useful.
 
+**But `OTEL_METRICS_EXPORTER=none` also throws away Datasette's own metrics.** If you want the thread
+pool gauges from section 2 in production, send metrics somewhere that accepts them rather than
+turning the exporter off. A Prometheus scrape endpoint needs no collector at all:
+
+```bash
+OTEL_SERVICE_NAME=datasette \
+OTEL_TRACES_EXPORTER=otlp \
+OTEL_METRICS_EXPORTER=prometheus \
+OTEL_LOGS_EXPORTER=none \
+OTEL_EXPORTER_PROMETHEUS_PORT=9464 \
+  uv run --with opentelemetry-exporter-prometheus \
+         --with opentelemetry-exporter-otlp-proto-http \
+         --with opentelemetry-instrumentation-asgi \
+    opentelemetry-instrument datasette mydb.db --plugins-dir demos/otel/plugins
+```
+
+Then `curl http://localhost:9464/metrics` and look for `datasette_sql_threads_queue_depth`.
+
 The `otel_asgi` plugin is worth loading here too: it creates the per-request root span that
 Datasette's spans nest underneath. Without it the nesting among Datasette's own spans is still
 correct, but there is no enclosing HTTP span, so a trace UI shows dozens of unrelated single-span
@@ -282,11 +345,20 @@ been verified here against a specific vendor's collector.
 
 ## Privacy
 
-`db.query.text` **is** recorded, truncated to 2048 characters. SQL **parameter values are never
-recorded** — only `datasette.param_count`. Actor identifiers are never recorded — only
-`datasette.actor_present`.
+`db.query.text` **is** recorded on spans, truncated to 2048 characters. SQL **parameter values are
+not recorded by default** — only `datasette.param_count`. Actor identifiers are never recorded on
+spans — only `datasette.actor_present`.
+
+Parameter values can be turned on with the `trace_sql_parameters` setting, which defaults to `off`.
+Read that setting's documentation before enabling it: permission checks bind the actor as a SQL
+parameter, and canned queries using `_cookie_*` or `_header_*` magic parameters can bind session
+cookies and `Authorization` headers as ordinary parameters.
+
+Metrics carry no SQL text, no parameter values and no actor information. Their only non-numeric
+attribute is `db.namespace`, the database name.
 
 On a public Datasette instance the SQL text is user-supplied. If you export to a third-party vendor,
 that text leaves your infrastructure.
 
-See the `internals_telemetry` section of the Datasette documentation for the full span reference.
+See the `internals_telemetry` section of the Datasette documentation for the full span and metric
+reference.
